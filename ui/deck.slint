@@ -1,12 +1,18 @@
 import { Theme } from "theme.slint";
-import { TransportButton } from "controls.slint";
+import { TransportButton, HotCuePad } from "controls.slint";
 
 export component WaveformView inherits Rectangle {
     in property <color> accent: Theme.deck-a;
     in property <[float]> peaks: [];
     in property <float> playhead: 0.0;
     in property <float> beat-spacing: 0.05;
+    in property <float> grid-offset: 0.0;
     in property <bool> show-grid: true;
+    in property <float> loop-start: -1.0;
+    in property <float> loop-end: -1.0;
+    in property <bool> seekable: false;
+    callback seek(float);
+    callback context-at(float, float, float);
 
     background: Theme.elevated;
     border-radius: 4px;
@@ -14,7 +20,6 @@ export component WaveformView inherits Rectangle {
     border-color: Theme.border;
     clip: true;
 
-    // Precomputed peak bars
     for peak[i] in peaks: Rectangle {
         width: max(1px, parent.width / max(1.0, peaks.length * 1.0));
         height: max(1px, parent.height * abs(peak));
@@ -23,20 +28,53 @@ export component WaveformView inherits Rectangle {
         background: accent.with-alpha(0.55 + abs(peak) * 0.4);
     }
 
-    // Beat grid
-    if show-grid && beat-spacing > 0.001: Rectangle {
-        width: 1px;
+    // Beat grid lines (approx 32 visible marks from spacing)
+    if show-grid && beat-spacing > 0.002: Rectangle {
+        width: 100%;
         height: 100%;
-        x: 0px;
         background: transparent;
+        for t[i] in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]: Rectangle {
+            width: 1px;
+            height: 100%;
+            x: parent.width * min(1.0, max(0.0, root.grid-offset + i * root.beat-spacing));
+            background: (i / 4) * 4 == i ? Theme.text-primary.with-alpha(0.28) : Theme.text-secondary.with-alpha(0.12);
+        }
     }
 
-    // Playhead
+    if loop-start >= 0 && loop-end > loop-start: Rectangle {
+        x: parent.width * loop-start;
+        width: parent.width * (loop-end - loop-start);
+        height: 100%;
+        background: accent.with-alpha(0.15);
+        border-width: 1px;
+        border-color: accent.with-alpha(0.5);
+    }
+
     Rectangle {
         width: 2px;
         height: 100%;
         x: parent.width * playhead;
         background: Theme.text-primary.with-alpha(0.85);
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                root.context-at(self.mouse-x / 1px / (parent.width / 1px), self.absolute-position.x / 1px + self.mouse-x / 1px, self.absolute-position.y / 1px + self.mouse-y / 1px);
+            }
+            if (seekable && event.button == PointerEventButton.left && (event.kind == PointerEventKind.down || event.kind == PointerEventKind.move)) {
+                if (self.pressed || event.kind == PointerEventKind.down) {
+                    root.seek(max(0.0, min(1.0, self.mouse-x / 1px / (parent.width / 1px))));
+                }
+            }
+        }
+        moved => {
+            if (seekable && self.pressed) {
+                root.seek(max(0.0, min(1.0, self.mouse-x / 1px / (parent.width / 1px))));
+            }
+        }
     }
 }
 
@@ -58,12 +96,24 @@ export component DeckPanel inherits Rectangle {
     in property <float> playhead: 0.0;
     in property <string> time-text: "0:00.0";
     in property <string> effective-bpm-text: "";
+    in property <float> beat-spacing: 0.04;
+    in property <float> grid-offset: 0.0;
+    in property <float> loop-start: -1.0;
+    in property <float> loop-end: -1.0;
+    in property <bool> loop-on: false;
+    in property <[bool]> hot-cues: [false, false, false, false, false, false, false, false];
 
     callback play-clicked();
     callback cue-clicked();
     callback sync-clicked();
     callback loop-clicked();
     callback browse-clicked();
+    callback seek(float);
+    callback beat-jump(float);
+    callback nudge-pressed(bool);
+    callback hot-cue(int, bool);
+    callback deck-context(float, float);
+    callback wave-context(float, float, float);
     callback geometry-changed(float, float, float, float);
 
     background: drop-hover ? #2A2F36 : Theme.panel;
@@ -71,34 +121,55 @@ export component DeckPanel inherits Rectangle {
     border-width: drop-hover ? 2px : 1px;
     border-color: drop-hover ? accent : Theme.border;
 
+    function report-geo() {
+        root.geometry-changed(
+            self.absolute-position.x / 1px,
+            self.absolute-position.y / 1px,
+            self.width / 1px,
+            self.height / 1px
+        );
+    }
+
+    changed width => { report-geo(); }
+    changed height => { report-geo(); }
+    changed absolute-position => { report-geo(); }
+
     VerticalLayout {
         padding: 12px;
-        spacing: 8px;
+        spacing: 6px;
 
-        HorizontalLayout {
-            spacing: 8px;
-            Text {
-                text: deck-name;
-                color: accent;
-                font-size: 12px;
-                font-weight: 700;
-                font-family: "Segoe UI";
+        TouchArea {
+            height: 22px;
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                    root.deck-context(self.absolute-position.x / 1px + self.mouse-x / 1px, self.absolute-position.y / 1px + self.mouse-y / 1px);
+                }
             }
-            if is-synced: Text {
-                text: "SYNCED";
-                color: Theme.synced;
-                font-size: 10px;
-                font-weight: 700;
-                font-family: "Segoe UI";
-                vertical-alignment: center;
-            }
-            Rectangle { horizontal-stretch: 1; background: transparent; }
-            Text {
-                text: status-text;
-                color: Theme.text-secondary;
-                font-size: 10px;
-                font-family: "Segoe UI";
-                vertical-alignment: center;
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: deck-name;
+                    color: accent;
+                    font-size: 12px;
+                    font-weight: 700;
+                    font-family: "Segoe UI";
+                }
+                if is-synced: Text {
+                    text: "SYNCED";
+                    color: Theme.synced;
+                    font-size: 10px;
+                    font-weight: 700;
+                    font-family: "Segoe UI";
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Text {
+                    text: status-text;
+                    color: Theme.text-secondary;
+                    font-size: 10px;
+                    font-family: "Segoe UI";
+                    vertical-alignment: center;
+                }
             }
         }
 
@@ -167,18 +238,30 @@ export component DeckPanel inherits Rectangle {
             }
 
             WaveformView {
-                height: 96px;
+                height: 88px;
                 accent: root.accent;
                 peaks: root.peaks;
                 playhead: root.playhead;
+                beat-spacing: root.beat-spacing;
+                grid-offset: root.grid-offset;
+                loop-start: root.loop-start;
+                loop-end: root.loop-end;
+                seekable: true;
+                seek(p) => { root.seek(p); }
+                context-at(p, x, y) => { root.wave-context(p, x, y); }
             }
 
             WaveformView {
-                height: 28px;
+                height: 26px;
                 accent: root.accent.with-alpha(0.7);
                 peaks: root.overview-peaks;
                 playhead: root.playhead;
                 show-grid: false;
+                loop-start: root.loop-start;
+                loop-end: root.loop-end;
+                seekable: true;
+                seek(p) => { root.seek(p); }
+                context-at(p, x, y) => { root.wave-context(p, x, y); }
             }
 
             HorizontalLayout {
@@ -208,6 +291,18 @@ export component DeckPanel inherits Rectangle {
             }
 
             HorizontalLayout {
+                spacing: 4px;
+                HotCuePad { slot: 0; set: hot-cues[0]; accent: root.accent; enabled: can-play; triggered(s, sh) => { root.hot-cue(s, sh); } }
+                HotCuePad { slot: 1; set: hot-cues[1]; accent: root.accent; enabled: can-play; triggered(s, sh) => { root.hot-cue(s, sh); } }
+                HotCuePad { slot: 2; set: hot-cues[2]; accent: root.accent; enabled: can-play; triggered(s, sh) => { root.hot-cue(s, sh); } }
+                HotCuePad { slot: 3; set: hot-cues[3]; accent: root.accent; enabled: can-play; triggered(s, sh) => { root.hot-cue(s, sh); } }
+                HotCuePad { slot: 4; set: hot-cues[4]; accent: root.accent; enabled: can-play; triggered(s, sh) => { root.hot-cue(s, sh); } }
+                HotCuePad { slot: 5; set: hot-cues[5]; accent: root.accent; enabled: can-play; triggered(s, sh) => { root.hot-cue(s, sh); } }
+                HotCuePad { slot: 6; set: hot-cues[6]; accent: root.accent; enabled: can-play; triggered(s, sh) => { root.hot-cue(s, sh); } }
+                HotCuePad { slot: 7; set: hot-cues[7]; accent: root.accent; enabled: can-play; triggered(s, sh) => { root.hot-cue(s, sh); } }
+            }
+
+            HorizontalLayout {
                 spacing: 6px;
                 TransportButton {
                     label: is-playing ? "PAUSE" : "PLAY";
@@ -230,10 +325,58 @@ export component DeckPanel inherits Rectangle {
                     clicked => { root.sync-clicked(); }
                 }
                 TransportButton {
-                    label: "LOOP";
+                    label: loop-on ? "LOOP●" : "LOOP";
                     accent: root.accent;
+                    active: loop-on;
                     enabled: can-play;
                     clicked => { root.loop-clicked(); }
+                }
+                TransportButton {
+                    label: "◀4";
+                    accent: root.accent;
+                    enabled: can-play;
+                    clicked => { root.beat-jump(-4.0); }
+                }
+                TransportButton {
+                    label: "◀1";
+                    accent: root.accent;
+                    enabled: can-play;
+                    clicked => { root.beat-jump(-1.0); }
+                }
+                TransportButton {
+                    label: "1▶";
+                    accent: root.accent;
+                    enabled: can-play;
+                    clicked => { root.beat-jump(1.0); }
+                }
+                TransportButton {
+                    label: "4▶";
+                    accent: root.accent;
+                    enabled: can-play;
+                    clicked => { root.beat-jump(4.0); }
+                }
+                TouchArea {
+                    width: 52px;
+                    height: 28px;
+                    pointer-event(event) => {
+                        if (event.kind == PointerEventKind.down) { root.nudge-pressed(true); }
+                        if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) { root.nudge-pressed(false); }
+                    }
+                    Rectangle {
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: Theme.elevated;
+                        Text {
+                            text: "NUDGE";
+                            color: Theme.text-primary;
+                            font-size: 10px;
+                            font-weight: 600;
+                            font-family: "Segoe UI";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
                 }
             }
         }

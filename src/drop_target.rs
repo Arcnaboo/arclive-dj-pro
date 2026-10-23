@@ -1,16 +1,19 @@
 //! Windows Explorer file drop hit-testing.
 //!
-//! Slint DropArea is in-app only. Explorer paths arrive via winit
-//! `HoveredFile` / `DroppedFile`. Destination is chosen from cursor
-//! position against published deck/library rectangles.
+//! Slint DropArea is in-app only. Explorer paths arrive via OLE
+//! `IDropTarget` or winit `HoveredFile` / `DroppedFile`. Destination is
+//! chosen from cursor position against published deck/library rectangles
+//! in **logical** pixels.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DropZone {
     DeckA,
     DeckB,
     Library,
+    #[default]
     None,
 }
 
@@ -52,6 +55,68 @@ impl DropLayout {
             return DropZone::Library;
         }
         DropZone::None
+    }
+
+    /// Hit-test a physical (device) point using the window scale factor.
+    pub fn hit_test_physical(&self, px: f64, py: f64, scale: f64) -> DropZone {
+        let scale = scale.max(0.1);
+        self.hit_test(px / scale, py / scale)
+    }
+}
+
+/// Convert physical client coordinates to logical UI coordinates.
+pub fn physical_to_logical(px: f64, py: f64, scale: f64) -> (f64, f64) {
+    let scale = scale.max(0.1);
+    (px / scale, py / scale)
+}
+
+/// Coalesce multiple winit `DroppedFile` events into one decision.
+#[derive(Debug, Default)]
+pub struct DropAccumulator {
+    paths: Vec<PathBuf>,
+    first_at: Option<Instant>,
+    zone: DropZone,
+    cursor: (f64, f64),
+}
+
+impl DropAccumulator {
+    pub fn push(&mut self, path: PathBuf, zone: DropZone, cursor: (f64, f64)) {
+        if self.paths.is_empty() {
+            self.first_at = Some(Instant::now());
+            self.zone = zone;
+            self.cursor = cursor;
+        }
+        if !self.paths.iter().any(|p| p == &path) {
+            self.paths.push(path);
+        }
+        // Prefer a real zone if a later event hits a target.
+        if zone != DropZone::None {
+            self.zone = zone;
+            self.cursor = cursor;
+        }
+    }
+
+    pub fn ready(&self, window: Duration) -> bool {
+        match self.first_at {
+            Some(t) => t.elapsed() >= window,
+            None => false,
+        }
+    }
+
+    pub fn take(&mut self) -> Option<(DropZone, Vec<PathBuf>, (f64, f64))> {
+        if self.paths.is_empty() {
+            return None;
+        }
+        let paths = std::mem::take(&mut self.paths);
+        let zone = self.zone;
+        let cursor = self.cursor;
+        self.first_at = None;
+        self.zone = DropZone::None;
+        Some((zone, paths, cursor))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
     }
 }
 
@@ -215,5 +280,53 @@ mod tests {
         assert!(is_supported_audio(Path::new("track.MP3")));
         assert!(is_supported_audio(Path::new("x.flac")));
         assert!(!is_supported_audio(Path::new("doc.pdf")));
+    }
+
+    #[test]
+    fn dpi_hit_test_maps_physical_to_logical() {
+        let layout = DropLayout {
+            deck_a: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            deck_b: Rect {
+                x: 120.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            library: Rect {
+                x: 0.0,
+                y: 120.0,
+                w: 220.0,
+                h: 80.0,
+            },
+        };
+        // 150% DPI: logical (10,10) is physical (15,15)
+        assert_eq!(layout.hit_test_physical(15.0, 15.0, 1.5), DropZone::DeckA);
+        assert_eq!(layout.hit_test_physical(225.0, 15.0, 1.5), DropZone::DeckB);
+        let (lx, ly) = physical_to_logical(30.0, 30.0, 2.0);
+        assert!((lx - 15.0).abs() < 1e-9 && (ly - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_file_library_imports() {
+        let paths = vec![PathBuf::from("a.wav"), PathBuf::from("b.mp3")];
+        match decide_drop(DropZone::Library, &paths, false, true) {
+            DropDecision::ImportLibrary { paths: p } => assert_eq!(p.len(), 2),
+            other => panic!("expected import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accumulator_coalesces_paths() {
+        let mut acc = DropAccumulator::default();
+        acc.push(PathBuf::from("a.wav"), DropZone::DeckA, (1.0, 2.0));
+        acc.push(PathBuf::from("b.wav"), DropZone::DeckA, (1.0, 2.0));
+        let (zone, paths, _) = acc.take().unwrap();
+        assert_eq!(zone, DropZone::DeckA);
+        assert_eq!(paths.len(), 2);
     }
 }

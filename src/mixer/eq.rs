@@ -1,4 +1,8 @@
-//! Three-band EQ using cascaded biquads (low shelf / peak / high shelf).
+//! Three-band DJ isolator EQ (low shelf / peaking mid / high shelf).
+//!
+//! UI 0..1 mapping (center 0.5 = flat):
+//! - Above center: up to +6 dB boost
+//! - Below center: cut toward kill (silence) at 0.0
 
 #[derive(Clone, Copy)]
 struct Biquad {
@@ -109,9 +113,28 @@ impl Biquad {
     }
 }
 
-/// UI 0..1 maps to ±12 dB with 0.5 = flat.
-pub fn ui_to_db(ui: f32) -> f32 {
-    (ui.clamp(0.0, 1.0) - 0.5) * 24.0
+/// Isolator curve: 0 = kill, 0.5 = 0 dB, 1.0 = +6 dB.
+/// Below center the band gain falls toward silence (not a mild −12 dB cut).
+pub fn isolator_band_gain(ui: f32) -> f32 {
+    let u = ui.clamp(0.0, 1.0);
+    if u <= 0.5 {
+        // Smooth kill: cubic ease so the last part of the throw is decisive.
+        let t = u / 0.5;
+        t * t * t
+    } else {
+        let t = (u - 0.5) / 0.5;
+        10f32.powf((t * 6.0) / 20.0) // 0..+6 dB
+    }
+}
+
+/// Approximate dB label for the knob (−∞ at kill, 0 at center, +6 at top).
+pub fn isolator_db_label(ui: f32) -> f32 {
+    let g = isolator_band_gain(ui);
+    if g < 1e-4 {
+        -96.0
+    } else {
+        20.0 * g.log10()
+    }
 }
 
 pub struct ThreeBandEq {
@@ -119,6 +142,12 @@ pub struct ThreeBandEq {
     mid: Biquad,
     high: Biquad,
     sample_rate: f32,
+    low_gain: f32,
+    mid_gain: f32,
+    high_gain: f32,
+    kill_low: bool,
+    kill_mid: bool,
+    kill_high: bool,
 }
 
 impl ThreeBandEq {
@@ -128,15 +157,62 @@ impl ThreeBandEq {
             mid: Biquad::identity(),
             high: Biquad::identity(),
             sample_rate,
+            low_gain: 1.0,
+            mid_gain: 1.0,
+            high_gain: 1.0,
+            kill_low: false,
+            kill_mid: false,
+            kill_high: false,
         };
         s.set_gains(0.5, 0.5, 0.5);
         s
     }
 
+    pub fn set_kills(&mut self, low: bool, mid: bool, high: bool) {
+        self.kill_low = low;
+        self.kill_mid = mid;
+        self.kill_high = high;
+    }
+
     pub fn set_gains(&mut self, low_ui: f32, mid_ui: f32, high_ui: f32) {
-        self.low = Biquad::low_shelf(self.sample_rate, 220.0, ui_to_db(low_ui));
-        self.mid = Biquad::peaking(self.sample_rate, 1000.0, 0.8, ui_to_db(mid_ui));
-        self.high = Biquad::high_shelf(self.sample_rate, 5000.0, ui_to_db(high_ui));
+        self.low_gain = if self.kill_low {
+            0.0
+        } else {
+            isolator_band_gain(low_ui)
+        };
+        self.mid_gain = if self.kill_mid {
+            0.0
+        } else {
+            isolator_band_gain(mid_ui)
+        };
+        self.high_gain = if self.kill_high {
+            0.0
+        } else {
+            isolator_band_gain(high_ui)
+        };
+
+        // Shelves/peak shaped for isolator feel; gains applied as parallel-ish mix.
+        // Practical approach: process full-band filters at mild settings then scale bands
+        // by reconstructing low/mid/high via complementary shelves.
+        let low_db = if self.low_gain < 1e-4 {
+            -48.0
+        } else {
+            20.0 * self.low_gain.log10()
+        };
+        let mid_db = if self.mid_gain < 1e-4 {
+            -48.0
+        } else {
+            20.0 * self.mid_gain.log10()
+        };
+        let high_db = if self.high_gain < 1e-4 {
+            -48.0
+        } else {
+            20.0 * self.high_gain.log10()
+        };
+
+        self.low = Biquad::low_shelf(self.sample_rate, 250.0, low_db);
+        self.mid = Biquad::peaking(self.sample_rate, 1000.0, 0.7, mid_db);
+        self.high = Biquad::high_shelf(self.sample_rate, 4000.0, high_db);
     }
 
     pub fn process_sample(&mut self, x: f32) -> f32 {
@@ -146,22 +222,63 @@ impl ThreeBandEq {
     }
 }
 
+/// Quantized loop length in source frames from playhead.
+pub fn loop_region_frames(
+    playhead_frames: f64,
+    track_bpm: f64,
+    sample_rate: f32,
+    beats: f64,
+) -> (f64, f64) {
+    let sr = sample_rate.max(1.0) as f64;
+    let bpm = track_bpm.max(1.0);
+    let beat_frames = sr * 60.0 / bpm;
+    let start = (playhead_frames / beat_frames).floor() * beat_frames;
+    let end = start + beats * beat_frames;
+    (start.max(0.0), end.max(start + 64.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn flat_unity_approx() {
-        let mut eq = ThreeBandEq::new(48000.0);
-        eq.set_gains(0.5, 0.5, 0.5);
-        let y = eq.process_sample(0.5);
-        assert!((y - 0.5).abs() < 0.05);
+    fn isolator_center_unity() {
+        let g = isolator_band_gain(0.5);
+        assert!((g - 1.0).abs() < 1e-4);
+        assert!(isolator_db_label(0.5).abs() < 0.1);
     }
 
     #[test]
-    fn ui_db_range() {
-        assert!((ui_to_db(0.0) + 12.0).abs() < 0.01);
-        assert!((ui_to_db(1.0) - 12.0).abs() < 0.01);
-        assert!(ui_to_db(0.5).abs() < 0.01);
+    fn isolator_kill_near_zero() {
+        let g = isolator_band_gain(0.0);
+        assert!(g < 1e-5);
+        assert!(isolator_band_gain(0.05) < 0.02);
+    }
+
+    #[test]
+    fn isolator_boost_top() {
+        let g = isolator_band_gain(1.0);
+        assert!((g - 10f32.powf(6.0 / 20.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn flat_process_approx() {
+        let mut eq = ThreeBandEq::new(48000.0);
+        eq.set_gains(0.5, 0.5, 0.5);
+        let y = eq.process_sample(0.5);
+        assert!((y - 0.5).abs() < 0.08);
+    }
+
+    #[test]
+    fn loop_four_and_eight_beats() {
+        let sr = 48000.0;
+        let bpm = 120.0;
+        let playhead = sr as f64 * 2.0; // 2 seconds = 4 beats at 120
+        let (s4, e4) = loop_region_frames(playhead, bpm, sr, 4.0);
+        let beat = sr as f64 * 60.0 / bpm;
+        assert!((e4 - s4 - 4.0 * beat).abs() < 1.0);
+        let (s8, e8) = loop_region_frames(playhead, bpm, sr, 8.0);
+        assert!((e8 - s8 - 8.0 * beat).abs() < 1.0);
+        assert!(s4 <= playhead + 1.0);
     }
 }

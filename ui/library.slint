@@ -22,9 +22,14 @@ export component LibraryPanel inherits Rectangle {
     callback search-changed(string);
     callback import-folder();
     callback import-files();
+    callback row-selected(int);
     callback row-activated(int);
-    callback drag-row(int);
+    callback row-context(int, float, float);
+    callback drag-begin(int);
+    callback drag-move(float, float);
+    callback drag-end(float, float);
     callback toggle-collapsed();
+    callback geometry-changed(float, float, float, float);
 
     background: drop-hover ? #2A2F36 : Theme.panel;
     border-radius: 6px;
@@ -32,6 +37,18 @@ export component LibraryPanel inherits Rectangle {
     border-color: drop-hover ? Theme.synced : Theme.border;
     min-height: collapsed ? 36px : 160px;
     vertical-stretch: collapsed ? 0 : 1;
+
+    function report-geo() {
+        root.geometry-changed(
+            self.absolute-position.x / 1px,
+            self.absolute-position.y / 1px,
+            self.width / 1px,
+            self.height / 1px
+        );
+    }
+    changed width => { report-geo(); }
+    changed height => { report-geo(); }
+    changed absolute-position => { report-geo(); }
 
     VerticalLayout {
         padding: 8px;
@@ -125,6 +142,9 @@ export component LibraryPanel inherits Rectangle {
                     for track[i] in tracks: Rectangle {
                         height: 28px;
                         background: i == selected-index ? Theme.elevated : transparent;
+                        property <float> press-x: 0;
+                        property <float> press-y: 0;
+                        property <bool> row-dragging: false;
 
                         HorizontalLayout {
                             padding-left: 8px;
@@ -140,7 +160,36 @@ export component LibraryPanel inherits Rectangle {
                         }
 
                         TouchArea {
-                            clicked => { root.row-activated(i); }
+                            pointer-event(event) => {
+                                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                    root.row-context(i, parent.absolute-position.x / 1px + self.mouse-x / 1px, parent.absolute-position.y / 1px + self.mouse-y / 1px);
+                                }
+                                if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                                    parent.press-x = self.mouse-x / 1px;
+                                    parent.press-y = self.mouse-y / 1px;
+                                    parent.row-dragging = false;
+                                    root.row-selected(i);
+                                }
+                                if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                                    if (parent.row-dragging) {
+                                        root.drag-end(parent.absolute-position.x / 1px + self.mouse-x / 1px, parent.absolute-position.y / 1px + self.mouse-y / 1px);
+                                    }
+                                    parent.row-dragging = false;
+                                }
+                            }
+                            moved => {
+                                if (self.pressed) {
+                                    // Prefer horizontal motion so Flickable keeps vertical scroll.
+                                    if (!parent.row-dragging && abs(self.mouse-x / 1px - parent.press-x) > 8 && abs(self.mouse-x / 1px - parent.press-x) >= abs(self.mouse-y / 1px - parent.press-y)) {
+                                        parent.row-dragging = true;
+                                        root.drag-begin(i);
+                                    }
+                                    if (parent.row-dragging) {
+                                        root.drag-move(parent.absolute-position.x / 1px + self.mouse-x / 1px, parent.absolute-position.y / 1px + self.mouse-y / 1px);
+                                    }
+                                }
+                            }
+                            double-clicked => { root.row-activated(i); }
                         }
                     }
                 }

@@ -4,30 +4,40 @@ export component Knob inherits Rectangle {
     in-out property <float> value: 0.5;
     in property <string> label: "";
     in property <color> accent: Theme.text-secondary;
+    in property <bool> show-db: true;
     callback changed(float);
 
-    width: 44px;
-    height: 56px;
+    width: 48px;
+    height: 64px;
     background: transparent;
 
     property <float> drag-start-y: 0;
     property <float> drag-start-value: 0.5;
     property <bool> dragging: false;
+    property <bool> fine: false;
 
     VerticalLayout {
         spacing: 2px;
         alignment: center;
 
         Rectangle {
-            width: 36px;
-            height: 36px;
-            border-radius: 18px;
+            width: 40px;
+            height: 40px;
+            border-radius: 20px;
             border-width: 1.5px;
             border-color: Theme.border;
             background: Theme.elevated;
 
+            Rectangle {
+                width: 2px;
+                height: 6px;
+                x: (parent.width - self.width) / 2;
+                y: 3px;
+                background: Theme.text-secondary.with-alpha(0.7);
+            }
+
             Text {
-                text: round(root.value * 100);
+                text: show-db ? (value < 0.02 ? "-∞" : round((value - 0.5) * 12) + "dB") : round(value * 100);
                 color: Theme.text-secondary;
                 font-size: 9px;
                 font-family: "Segoe UI";
@@ -45,20 +55,24 @@ export component Knob inherits Rectangle {
         }
     }
 
-    ta := TouchArea {
+    TouchArea {
         width: 100%;
         height: 100%;
-        moved => {
-            if (self.pressed) {
-                if (!root.dragging) {
-                    root.dragging = true;
-                    root.drag-start-y = self.mouse-y / 1px;
-                    root.drag-start-value = root.value;
-                }
-                root.value = max(0.0, min(1.0, root.drag-start-value + (root.drag-start-y - self.mouse-y / 1px) / 80.0));
-                root.changed(root.value);
-            } else {
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.fine = event.modifiers.shift;
+                root.dragging = true;
+                root.drag-start-y = self.mouse-y / 1px;
+                root.drag-start-value = root.value;
+            }
+            if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
                 root.dragging = false;
+            }
+        }
+        moved => {
+            if (self.pressed && root.dragging) {
+                root.value = max(0.0, min(1.0, root.drag-start-value + (root.drag-start-y - self.mouse-y / 1px) / (root.fine ? 240.0 : 80.0)));
+                root.changed(root.value);
             }
         }
         double-clicked => {
@@ -74,7 +88,7 @@ export component Fader inherits Rectangle {
     callback changed(float);
 
     width: 28px;
-    height: 120px;
+    height: 140px;
     background: Theme.elevated;
     border-radius: 4px;
     border-width: 1px;
@@ -114,7 +128,7 @@ export component Crossfader inherits Rectangle {
     in-out property <float> value: 0.5;
     callback changed(float);
 
-    height: 28px;
+    height: 32px;
     background: Theme.elevated;
     border-radius: 4px;
     border-width: 1px;
@@ -131,7 +145,7 @@ export component Crossfader inherits Rectangle {
 
     Rectangle {
         width: 14px;
-        height: 18px;
+        height: 20px;
         x: 8px + root.value * (parent.width - 30px);
         y: (parent.height - self.height) / 2;
         background: Theme.text-primary;
@@ -158,7 +172,7 @@ export component MeterBar inherits Rectangle {
     in property <float> level: 0.0;
     in property <bool> clipping: false;
     width: 8px;
-    height: 80px;
+    height: 100px;
     background: Theme.elevated;
     border-radius: 2px;
 
@@ -179,7 +193,7 @@ export component TransportButton inherits Rectangle {
     callback clicked;
 
     height: 28px;
-    min-width: 52px;
+    min-width: 48px;
     border-radius: 4px;
     border-width: 1px;
     border-color: active ? accent : Theme.border;
@@ -199,5 +213,68 @@ export component TransportButton inherits Rectangle {
     TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
+    }
+}
+
+export component KillButton inherits Rectangle {
+    in property <string> label: "K";
+    in property <bool> active: false;
+    in property <color> accent: Theme.error;
+    callback toggled;
+
+    width: 22px;
+    height: 18px;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: active ? accent : Theme.border;
+    background: active ? accent.with-alpha(0.25) : Theme.elevated;
+
+    Text {
+        text: label;
+        color: active ? accent : Theme.text-secondary;
+        font-size: 9px;
+        font-weight: 700;
+        font-family: "Segoe UI";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.toggled(); }
+    }
+}
+
+export component HotCuePad inherits Rectangle {
+    in property <int> slot: 0;
+    in property <bool> set: false;
+    in property <color> accent: Theme.deck-a;
+    in property <bool> enabled: true;
+    callback triggered(int, bool);
+
+    width: 28px;
+    height: 22px;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: set ? accent : Theme.border;
+    background: set ? accent.with-alpha(0.3) : Theme.elevated;
+    opacity: enabled ? 1.0 : 0.4;
+
+    Text {
+        text: slot + 1;
+        color: set ? accent : Theme.text-secondary;
+        font-size: 10px;
+        font-weight: 700;
+        font-family: "Segoe UI";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                root.triggered(root.slot, event.modifiers.shift);
+            }
+        }
     }
 }

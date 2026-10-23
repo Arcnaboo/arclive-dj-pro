@@ -15,13 +15,11 @@ export component AppWindow inherits Window {
     background: Theme.background;
     default-font-family: "Segoe UI";
 
-    // Master
     in-out property <float> master-bpm: 146.0;
     in property <string> master-bpm-text: "146.00";
     in property <string> status-banner: "";
     in property <bool> settings-open: false;
 
-    // Deck A
     in property <string> deck-a-title: "";
     in property <string> deck-a-artist: "";
     in property <string> deck-a-bpm: "";
@@ -37,8 +35,13 @@ export component AppWindow inherits Window {
     in property <float> deck-a-playhead: 0.0;
     in property <string> deck-a-time: "0:00.0";
     in property <string> deck-a-effective-bpm: "";
+    in property <float> deck-a-beat-spacing: 0.04;
+    in property <float> deck-a-grid-offset: 0.0;
+    in property <float> deck-a-loop-start: -1.0;
+    in property <float> deck-a-loop-end: -1.0;
+    in property <bool> deck-a-loop-on: false;
+    in property <[bool]> deck-a-hot-cues: [false, false, false, false, false, false, false, false];
 
-    // Deck B
     in property <string> deck-b-title: "";
     in property <string> deck-b-artist: "";
     in property <string> deck-b-bpm: "";
@@ -54,8 +57,13 @@ export component AppWindow inherits Window {
     in property <float> deck-b-playhead: 0.0;
     in property <string> deck-b-time: "0:00.0";
     in property <string> deck-b-effective-bpm: "";
+    in property <float> deck-b-beat-spacing: 0.04;
+    in property <float> deck-b-grid-offset: 0.0;
+    in property <float> deck-b-loop-start: -1.0;
+    in property <float> deck-b-loop-end: -1.0;
+    in property <bool> deck-b-loop-on: false;
+    in property <[bool]> deck-b-hot-cues: [false, false, false, false, false, false, false, false];
 
-    // Mixer
     in-out property <float> high-a: 0.5;
     in-out property <float> mid-a: 0.5;
     in-out property <float> low-a: 0.5;
@@ -79,8 +87,14 @@ export component AppWindow inherits Window {
     in property <bool> cue-b: false;
     in-out property <float> cue-blend: 0.0;
     in-out property <float> headphone-vol: 0.8;
+    in property <bool> kill-high-a: false;
+    in property <bool> kill-mid-a: false;
+    in property <bool> kill-low-a: false;
+    in property <bool> kill-high-b: false;
+    in property <bool> kill-mid-b: false;
+    in property <bool> kill-low-b: false;
+    in property <bool> preview-in-master: false;
 
-    // Library
     in property <[LibraryTrack]> library-tracks: [];
     in-out property <string> library-search: "";
     in property <bool> library-drop-hover: false;
@@ -88,7 +102,6 @@ export component AppWindow inherits Window {
     in property <int> library-selected: -1;
     in property <bool> library-collapsed: false;
 
-    // Settings
     in property <[string]> audio-devices: [];
     in property <int> master-device-index: 0;
     in property <int> cue-device-index: -1;
@@ -99,7 +112,6 @@ export component AppWindow inherits Window {
     in property <bool> cue-available: false;
     in property <string> settings-status: "";
 
-    // Layout geometry for hit-testing (logical px)
     in-out property <float> deck-a-x: 0;
     in-out property <float> deck-a-y: 0;
     in-out property <float> deck-a-w: 0;
@@ -112,6 +124,18 @@ export component AppWindow inherits Window {
     in-out property <float> library-y: 0;
     in-out property <float> library-w: 0;
     in-out property <float> library-h: 0;
+
+    // Context menu
+    in property <bool> ctx-open: false;
+    in property <float> ctx-x: 0;
+    in property <float> ctx-y: 0;
+    in property <[string]> ctx-items: [];
+
+    // Library drag ghost
+    in property <bool> lib-dragging: false;
+    in property <float> lib-drag-x: 0;
+    in property <float> lib-drag-y: 0;
+    in property <string> lib-drag-label: "";
 
     callback play-a();
     callback cue-a-btn();
@@ -131,19 +155,42 @@ export component AppWindow inherits Window {
     callback library-search-changed(string);
     callback import-folder();
     callback import-files();
+    callback library-row-selected(int);
     callback library-row-activated(int);
+    callback library-row-context(int, float, float);
+    callback library-drag-begin(int);
+    callback library-drag-move(float, float);
+    callback library-drag-end(float, float);
     callback toggle-library();
     callback bpm-nudge(float);
     callback bpm-tap();
     callback toggle-load-protection();
     callback cycle-crossfader-curve();
     callback request-layout-sync();
+    callback deck-a-geometry(float, float, float, float);
+    callback deck-b-geometry(float, float, float, float);
+    callback library-geometry(float, float, float, float);
+    callback seek-a(float);
+    callback seek-b(float);
+    callback beat-jump-a(float);
+    callback beat-jump-b(float);
+    callback nudge-a(bool);
+    callback nudge-b(bool);
+    callback hot-cue-a(int, bool);
+    callback hot-cue-b(int, bool);
+    callback deck-a-context(float, float);
+    callback deck-b-context(float, float);
+    callback wave-a-context(float, float, float);
+    callback wave-b-context(float, float, float);
+    callback kill-toggled(string);
+    callback preview-toggled();
+    callback ctx-action(int);
+    callback ctx-dismiss();
 
     VerticalLayout {
         padding: 12px;
         spacing: 10px;
 
-        // Toolbar
         HorizontalLayout {
             spacing: 16px;
             height: 40px;
@@ -220,7 +267,6 @@ export component AppWindow inherits Window {
             font-family: "Segoe UI";
         }
 
-        // Decks
         HorizontalLayout {
             spacing: 10px;
             vertical-stretch: 2;
@@ -243,11 +289,27 @@ export component AppWindow inherits Window {
                 playhead: deck-a-playhead;
                 time-text: deck-a-time;
                 effective-bpm-text: deck-a-effective-bpm;
+                beat-spacing: deck-a-beat-spacing;
+                grid-offset: deck-a-grid-offset;
+                loop-start: deck-a-loop-start;
+                loop-end: deck-a-loop-end;
+                loop-on: deck-a-loop-on;
+                hot-cues: deck-a-hot-cues;
                 play-clicked => { root.play-a(); }
                 cue-clicked => { root.cue-a-btn(); }
                 sync-clicked => { root.sync-a(); }
                 loop-clicked => { root.loop-a(); }
                 browse-clicked => { root.browse-a(); }
+                seek(p) => { root.seek-a(p); }
+                beat-jump(b) => { root.beat-jump-a(b); }
+                nudge-pressed(on) => { root.nudge-a(on); }
+                hot-cue(s, sh) => { root.hot-cue-a(s, sh); }
+                deck-context(x, y) => { root.deck-a-context(x, y); }
+                wave-context(p, x, y) => { root.wave-a-context(p, x, y); }
+                geometry-changed(x, y, w, h) => {
+                    deck-a-x = x; deck-a-y = y; deck-a-w = w; deck-a-h = h;
+                    root.deck-a-geometry(x, y, w, h);
+                }
             }
 
             deck-b := DeckPanel {
@@ -268,11 +330,27 @@ export component AppWindow inherits Window {
                 playhead: deck-b-playhead;
                 time-text: deck-b-time;
                 effective-bpm-text: deck-b-effective-bpm;
+                beat-spacing: deck-b-beat-spacing;
+                grid-offset: deck-b-grid-offset;
+                loop-start: deck-b-loop-start;
+                loop-end: deck-b-loop-end;
+                loop-on: deck-b-loop-on;
+                hot-cues: deck-b-hot-cues;
                 play-clicked => { root.play-b(); }
                 cue-clicked => { root.cue-b-btn(); }
                 sync-clicked => { root.sync-b(); }
                 loop-clicked => { root.loop-b(); }
                 browse-clicked => { root.browse-b(); }
+                seek(p) => { root.seek-b(p); }
+                beat-jump(b) => { root.beat-jump-b(b); }
+                nudge-pressed(on) => { root.nudge-b(on); }
+                hot-cue(s, sh) => { root.hot-cue-b(s, sh); }
+                deck-context(x, y) => { root.deck-b-context(x, y); }
+                wave-context(p, x, y) => { root.wave-b-context(p, x, y); }
+                geometry-changed(x, y, w, h) => {
+                    deck-b-x = x; deck-b-y = y; deck-b-w = w; deck-b-h = h;
+                    root.deck-b-geometry(x, y, w, h);
+                }
             }
         }
 
@@ -300,9 +378,19 @@ export component AppWindow inherits Window {
             cue-b: cue-b;
             cue-blend <=> cue-blend;
             headphone-vol <=> headphone-vol;
+            kill-high-a: kill-high-a;
+            kill-mid-a: kill-mid-a;
+            kill-low-a: kill-low-a;
+            kill-high-b: kill-high-b;
+            kill-mid-b: kill-mid-b;
+            kill-low-b: kill-low-b;
+            preview-in-master: preview-in-master;
+            cue-available: cue-available;
             param-changed => { root.mixer-changed(); }
             cue-a-toggled => { root.cue-a-toggle(); }
             cue-b-toggled => { root.cue-b-toggle(); }
+            kill-toggled(k) => { root.kill-toggled(k); }
+            preview-toggled => { root.preview-toggled(); }
         }
 
         lib := LibraryPanel {
@@ -315,8 +403,85 @@ export component AppWindow inherits Window {
             search-changed(s) => { root.library-search-changed(s); }
             import-folder => { root.import-folder(); }
             import-files => { root.import-files(); }
+            row-selected(i) => { root.library-row-selected(i); }
             row-activated(i) => { root.library-row-activated(i); }
+            row-context(i, x, y) => { root.library-row-context(i, x, y); }
+            drag-begin(i) => { root.library-drag-begin(i); }
+            drag-move(x, y) => { root.library-drag-move(x, y); }
+            drag-end(x, y) => { root.library-drag-end(x, y); }
             toggle-collapsed => { root.toggle-library(); }
+            geometry-changed(x, y, w, h) => {
+                library-x = x; library-y = y; library-w = w; library-h = h;
+                root.library-geometry(x, y, w, h);
+            }
+        }
+    }
+
+    // Drag ghost
+    if lib-dragging: Rectangle {
+        x: lib-drag-x * 1px;
+        y: lib-drag-y * 1px;
+        width: 180px;
+        height: 28px;
+        border-radius: 4px;
+        background: Theme.elevated;
+        border-width: 1px;
+        border-color: Theme.synced;
+        z: 100;
+        Text {
+            text: lib-drag-label;
+            color: Theme.text-primary;
+            font-size: 11px;
+            font-family: "Segoe UI";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    // Context menu overlay
+    if ctx-open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        z: 200;
+        TouchArea {
+            clicked => { root.ctx-dismiss(); }
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                    root.ctx-dismiss();
+                }
+            }
+        }
+        Rectangle {
+            x: min(ctx-x * 1px, parent.width - 200px);
+            y: min(ctx-y * 1px, parent.height - (ctx-items.length * 28px + 8px));
+            width: 190px;
+            height: ctx-items.length * 28px + 8px;
+            background: Theme.elevated;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            VerticalLayout {
+                padding: 4px;
+                spacing: 0px;
+                for item[i] in ctx-items: Rectangle {
+                    height: 28px;
+                    border-radius: 4px;
+                    background: ta.has-hover ? Theme.panel : transparent;
+                    Text {
+                        text: "  " + item;
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        font-family: "Segoe UI";
+                        vertical-alignment: center;
+                    }
+                    ta := TouchArea {
+                        clicked => { root.ctx-action(i); }
+                    }
+                }
+            }
         }
     }
 
@@ -336,14 +501,16 @@ export component AppWindow inherits Window {
         cycle-crossfader-curve => { root.cycle-crossfader-curve(); }
     }
 
-    // Periodically sync geometry via Rust timer; also on resize
     changed width => { root.request-layout-sync(); }
     changed height => { root.request-layout-sync(); }
 
-    // Performance-safe shortcuts (no accidental global Stop).
     forward-focus: key-handler;
     key-handler := FocusScope {
         key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.ctx-dismiss();
+                return accept;
+            }
             if (event.text == " ") {
                 root.play-a();
                 return accept;
@@ -362,11 +529,6 @@ export component AppWindow inherits Window {
             }
             if (event.text == "s" || event.text == "S") {
                 root.sync-b();
-                return accept;
-            }
-            if (event.text == "/") {
-                // Focus search by selecting library search field via banner hint
-                root.library-search-changed(library-search);
                 return accept;
             }
             if (event.text == ",") {

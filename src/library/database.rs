@@ -199,6 +199,46 @@ impl LibraryDb {
         Ok(())
     }
 
+    pub fn get_hot_cues(&self, track_id: &str) -> Result<Vec<(i64, f64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT slot, position_secs, label FROM hot_cues WHERE track_id = ?1 ORDER BY slot",
+        )?;
+        let rows = stmt.query_map(params![track_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_hot_cue(&self, track_id: &str, slot: i64) -> Result<Option<f64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT position_secs FROM hot_cues WHERE track_id = ?1 AND slot = ?2",
+        )?;
+        let mut rows = stmt.query(params![track_id, slot])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn remove_track(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM hot_cues WHERE track_id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM playlist_tracks WHERE track_id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn path_for_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.get_by_id(id)?.map(|t| t.path))
+    }
+
     pub fn cache_analysis(
         &self,
         path: &str,

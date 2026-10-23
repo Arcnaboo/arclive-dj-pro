@@ -7,7 +7,9 @@ use crate::mixer::meter::PeakMeter;
 use crate::mixer::routing::CueRouting;
 use crate::warp::mapping::tempo_ratio;
 use crate::warp::stretch::RealtimeWsola;
-use crate::warp::sync::{phase_error_beats, sync_nudge_samples};
+use crate::warp::sync::{
+    beat_at_source, phase_error_beats, soft_sync_nudge_samples, sync_phase_seek_frames,
+};
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
@@ -25,6 +27,7 @@ pub struct DeckAudioState {
     pub samples: Arc<Vec<f32>>,
     pub sample_rate: u32,
     pub track_bpm: f64,
+    pub grid_offset_secs: f64,
     pub playing: bool,
     pub synced: bool,
     pub loop_enabled: bool,
@@ -35,6 +38,7 @@ pub struct DeckAudioState {
     pub filter: DeckFilter,
     pub cue_point: f64,
     pub read_frames: f64,
+    pub tempo_bend: f64,
 }
 
 impl DeckAudioState {
@@ -43,6 +47,7 @@ impl DeckAudioState {
             samples: Arc::new(Vec::new()),
             sample_rate: sr as u32,
             track_bpm: 120.0,
+            grid_offset_secs: 0.0,
             playing: false,
             synced: false,
             loop_enabled: false,
@@ -53,6 +58,7 @@ impl DeckAudioState {
             filter: DeckFilter::new(sr),
             cue_point: 0.0,
             read_frames: 0.0,
+            tempo_bend: 0.0,
         };
         s.stretcher.set_ratio(1.0);
         s
@@ -108,6 +114,12 @@ struct MixerParams {
     gain_b: f32,
     fader_b: f32,
     crossfader: f32,
+    kill_low_a: bool,
+    kill_mid_a: bool,
+    kill_high_a: bool,
+    kill_low_b: bool,
+    kill_mid_b: bool,
+    kill_high_b: bool,
     curve: CrossfaderCurve,
     cue: CueRouting,
 }
@@ -128,6 +140,12 @@ impl Default for MixerParams {
             gain_b: 0.7,
             fader_b: 1.0,
             crossfader: 0.5,
+            kill_low_a: false,
+            kill_mid_a: false,
+            kill_high_a: false,
+            kill_low_b: false,
+            kill_mid_b: false,
+            kill_high_b: false,
             curve: CrossfaderCurve::EqualPower,
             cue: CueRouting::default(),
         }
@@ -155,6 +173,7 @@ pub enum EngineCommand {
         sample_rate: u32,
         track_bpm: f64,
         master_bpm: f64,
+        grid_offset_secs: f64,
     },
     Play(DeckId),
     Pause(DeckId),
@@ -163,15 +182,39 @@ pub enum EngineCommand {
         id: DeckId,
         frames: f64,
     },
+    SetCuePoint {
+        id: DeckId,
+        frames: f64,
+    },
     SetSync {
         id: DeckId,
         synced: bool,
+    },
+    /// Hard lock follower to the other deck's next beat, then soft-drift.
+    SyncLock {
+        follower: DeckId,
     },
     SetLoop {
         id: DeckId,
         enabled: bool,
         start: f64,
         end: f64,
+    },
+    BeatJump {
+        id: DeckId,
+        beats: f64,
+    },
+    SetTempoBend {
+        id: DeckId,
+        bend: f64,
+    },
+    SetTrackBpm {
+        id: DeckId,
+        bpm: f64,
+    },
+    SetGridOffset {
+        id: DeckId,
+        offset_secs: f64,
     },
     SetMasterBpm(f64),
     SetMixer {
@@ -188,6 +231,12 @@ pub enum EngineCommand {
         gain_b: f32,
         fader_b: f32,
         crossfader: f32,
+        kill_low_a: bool,
+        kill_mid_a: bool,
+        kill_high_a: bool,
+        kill_low_b: bool,
+        kill_mid_b: bool,
+        kill_high_b: bool,
     },
     SetCurve(CrossfaderCurve),
     SetCue {
@@ -195,7 +244,9 @@ pub enum EngineCommand {
         cue_b: bool,
         blend: f32,
         hp_vol: f32,
+        preview_in_master: bool,
     },
+    Unload(DeckId),
 }
 
 pub struct AudioEngine {
@@ -331,6 +382,20 @@ impl AudioEngine {
     pub fn sample_rate(&self) -> f32 {
         self.inner.lock().sample_rate
     }
+
+    pub fn deck_position_frames(&self, id: DeckId) -> f64 {
+        let g = self.inner.lock();
+        match id {
+            DeckId::A => g.deck_a.read_frames,
+            DeckId::B => g.deck_b.read_frames,
+        }
+    }
+}
+
+fn apply_ratio(deck: &mut DeckAudioState, master_bpm: f64) {
+    let base = tempo_ratio(deck.track_bpm, master_bpm);
+    let bend = 1.0 + deck.tempo_bend;
+    deck.stretcher.set_ratio(base * bend);
 }
 
 fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
@@ -342,6 +407,7 @@ fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             sample_rate,
             track_bpm,
             master_bpm,
+            grid_offset_secs,
         } => {
             let sr = g.sample_rate;
             let deck = match id {
@@ -351,16 +417,26 @@ fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             deck.samples = samples;
             deck.sample_rate = sample_rate;
             deck.track_bpm = track_bpm;
+            deck.grid_offset_secs = grid_offset_secs;
             deck.playing = false;
             deck.synced = false;
             deck.read_frames = 0.0;
             deck.cue_point = 0.0;
+            deck.tempo_bend = 0.0;
+            deck.loop_enabled = false;
             deck.stretcher = RealtimeWsola::new();
-            deck.stretcher
-                .set_ratio(tempo_ratio(track_bpm, master_bpm));
+            apply_ratio(deck, master_bpm);
             deck.eq = ThreeBandEq::new(sr);
             deck.filter = DeckFilter::new(sr);
             g.master_bpm = master_bpm;
+        }
+        EngineCommand::Unload(id) => {
+            let sr = g.sample_rate;
+            match id {
+                DeckId::A => g.deck_a = DeckAudioState::empty(sr),
+                DeckId::B => g.deck_b = DeckAudioState::empty(sr),
+            }
+            g.clock_running = g.deck_a.playing || g.deck_b.playing;
         }
         EngineCommand::Play(id) => {
             match id {
@@ -393,6 +469,13 @@ fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             deck.read_frames = frames.max(0.0);
             deck.stretcher.seek_frames(deck.read_frames);
         }
+        EngineCommand::SetCuePoint { id, frames } => {
+            let deck = match id {
+                DeckId::A => &mut g.deck_a,
+                DeckId::B => &mut g.deck_b,
+            };
+            deck.cue_point = frames.max(0.0);
+        }
         EngineCommand::SetSync { id, synced } => {
             let master_bpm = g.master_bpm;
             let deck = match id {
@@ -401,10 +484,55 @@ fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             };
             deck.synced = synced;
             if synced {
-                let track_bpm = deck.track_bpm;
-                deck.stretcher
-                    .set_ratio(tempo_ratio(track_bpm, master_bpm));
+                apply_ratio(deck, master_bpm);
             }
+        }
+        EngineCommand::SyncLock { follower } => {
+            let master_bpm = g.master_bpm;
+            let (master, follower_deck) = match follower {
+                DeckId::A => (&g.deck_b as *const DeckAudioState, DeckId::A),
+                DeckId::B => (&g.deck_a as *const DeckAudioState, DeckId::B),
+            };
+            let master_ref = unsafe { &*master };
+            // Use the other deck's playhead even when paused — phase lock to where it is.
+            let has_master = !master_ref.samples.is_empty() && master_ref.track_bpm > 0.0;
+            if !has_master {
+                // No other track to lock to — still mark synced + tempo-match to master BPM.
+                let deck = match follower_deck {
+                    DeckId::A => &mut g.deck_a,
+                    DeckId::B => &mut g.deck_b,
+                };
+                deck.synced = true;
+                apply_ratio(deck, master_bpm);
+                return;
+            }
+            let master_pos_secs =
+                master_ref.stretcher.read_pos() / master_ref.sample_rate.max(1) as f64;
+            let master_bpm_eff = master_ref.track_bpm;
+            let master_off = master_ref.grid_offset_secs;
+
+            let deck = match follower_deck {
+                DeckId::A => &mut g.deck_a,
+                DeckId::B => &mut g.deck_b,
+            };
+            if deck.samples.is_empty() || deck.track_bpm <= 0.0 {
+                return;
+            }
+            let follower_pos_secs =
+                deck.stretcher.read_pos() / deck.sample_rate.max(1) as f64;
+            let target = sync_phase_seek_frames(
+                master_pos_secs,
+                master_bpm_eff,
+                master_off,
+                follower_pos_secs,
+                deck.track_bpm,
+                deck.grid_offset_secs,
+                deck.sample_rate as f64,
+            );
+            deck.synced = true;
+            apply_ratio(deck, master_bpm);
+            deck.read_frames = target;
+            deck.stretcher.seek_frames(target);
         }
         EngineCommand::SetLoop {
             id,
@@ -420,12 +548,50 @@ fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             deck.loop_start = start;
             deck.loop_end = end.max(start + 64.0);
         }
+        EngineCommand::BeatJump { id, beats } => {
+            let deck = match id {
+                DeckId::A => &mut g.deck_a,
+                DeckId::B => &mut g.deck_b,
+            };
+            if deck.track_bpm <= 0.0 {
+                return;
+            }
+            let beat_frames = deck.sample_rate as f64 * 60.0 / deck.track_bpm;
+            let delta = beats * beat_frames;
+            let total = (deck.samples.len() / 2) as f64;
+            let pos = (deck.read_frames + delta).clamp(0.0, total.max(0.0));
+            deck.read_frames = pos;
+            deck.stretcher.seek_frames(pos);
+        }
+        EngineCommand::SetTempoBend { id, bend } => {
+            let master_bpm = g.master_bpm;
+            let deck = match id {
+                DeckId::A => &mut g.deck_a,
+                DeckId::B => &mut g.deck_b,
+            };
+            deck.tempo_bend = bend.clamp(-0.08, 0.08);
+            apply_ratio(deck, master_bpm);
+        }
+        EngineCommand::SetTrackBpm { id, bpm } => {
+            let master_bpm = g.master_bpm;
+            let deck = match id {
+                DeckId::A => &mut g.deck_a,
+                DeckId::B => &mut g.deck_b,
+            };
+            deck.track_bpm = bpm.max(1.0);
+            apply_ratio(deck, master_bpm);
+        }
+        EngineCommand::SetGridOffset { id, offset_secs } => {
+            let deck = match id {
+                DeckId::A => &mut g.deck_a,
+                DeckId::B => &mut g.deck_b,
+            };
+            deck.grid_offset_secs = offset_secs;
+        }
         EngineCommand::SetMasterBpm(bpm) => {
             g.master_bpm = bpm;
-            let ra = tempo_ratio(g.deck_a.track_bpm, bpm);
-            let rb = tempo_ratio(g.deck_b.track_bpm, bpm);
-            g.deck_a.stretcher.set_ratio(ra);
-            g.deck_b.stretcher.set_ratio(rb);
+            apply_ratio(&mut g.deck_a, bpm);
+            apply_ratio(&mut g.deck_b, bpm);
         }
         EngineCommand::SetMixer {
             high_a,
@@ -441,6 +607,12 @@ fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             gain_b,
             fader_b,
             crossfader,
+            kill_low_a,
+            kill_mid_a,
+            kill_high_a,
+            kill_low_b,
+            kill_mid_b,
+            kill_high_b,
         } => {
             g.params.high_a = high_a;
             g.params.mid_a = mid_a;
@@ -455,6 +627,14 @@ fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             g.params.gain_b = gain_b;
             g.params.fader_b = fader_b;
             g.params.crossfader = crossfader;
+            g.params.kill_low_a = kill_low_a;
+            g.params.kill_mid_a = kill_mid_a;
+            g.params.kill_high_a = kill_high_a;
+            g.params.kill_low_b = kill_low_b;
+            g.params.kill_mid_b = kill_mid_b;
+            g.params.kill_high_b = kill_high_b;
+            g.deck_a.eq.set_kills(kill_low_a, kill_mid_a, kill_high_a);
+            g.deck_b.eq.set_kills(kill_low_b, kill_mid_b, kill_high_b);
             g.deck_a.eq.set_gains(low_a, mid_a, high_a);
             g.deck_b.eq.set_gains(low_b, mid_b, high_b);
             g.deck_a.filter.set_amount(filter_a);
@@ -466,11 +646,13 @@ fn apply_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             cue_b,
             blend,
             hp_vol,
+            preview_in_master,
         } => {
             g.params.cue.cue_a = cue_a;
             g.params.cue.cue_b = cue_b;
             g.params.cue.cue_master_blend = blend;
             g.params.cue.headphone_volume = hp_vol;
+            g.params.cue.preview_in_master = preview_in_master;
         }
     }
 }
@@ -492,11 +674,8 @@ fn process_block(
     render_deck(&mut g.deck_a, &mut buf_a, frames);
     render_deck(&mut g.deck_b, &mut buf_b, frames);
 
-    // Phase sync after rendering (tempo already applied via stretcher ratio).
-    let master_beats = clock.beats();
-    let master_bpm = g.master_bpm;
-    apply_phase_sync(&mut g.deck_a, master_beats, master_bpm, sr);
-    apply_phase_sync(&mut g.deck_b, master_beats, master_bpm, sr);
+    // Soft phase sync to the other playing deck (or master clock).
+    apply_soft_sync(&mut g);
 
     for i in 0..frames {
         for c in 0..2 {
@@ -528,6 +707,22 @@ fn process_block(
         }
     }
 
+    // Cue bus (pre-fader deck audio when cued)
+    let any_cue = g.params.cue.cue_a || g.params.cue.cue_b;
+    let mut cue_tmp = vec![0.0f32; frames * 2];
+    if any_cue {
+        for i in 0..frames * 2 {
+            let mut c = 0.0f32;
+            if g.params.cue.cue_a {
+                c += buf_a[i];
+            }
+            if g.params.cue.cue_b {
+                c += buf_b[i];
+            }
+            cue_tmp[i] = c;
+        }
+    }
+
     g.meter_a.process(&buf_a);
     g.meter_b.process(&buf_b);
     g.meter_m.process(&master_tmp);
@@ -556,9 +751,13 @@ fn process_block(
         clock.advance(frames as u32, sr as u32);
     }
 
+    let cue = g.params.cue;
     for i in 0..frames {
-        let l = master_tmp[i * 2].clamp(-1.0, 1.0);
-        let r = master_tmp[i * 2 + 1].clamp(-1.0, 1.0);
+        let mut l = master_tmp[i * 2].clamp(-1.0, 1.0);
+        let mut r = master_tmp[i * 2 + 1].clamp(-1.0, 1.0);
+        let (pl, pr) = cue.apply_preview(l, r, cue_tmp[i * 2], cue_tmp[i * 2 + 1], any_cue);
+        l = pl.clamp(-1.0, 1.0);
+        r = pr.clamp(-1.0, 1.0);
         if out_channels == 1 {
             data[i] = (l + r) * 0.5;
         } else {
@@ -592,18 +791,37 @@ fn render_deck(deck: &mut DeckAudioState, out: &mut [f32], _frames: usize) {
     }
 }
 
-/// Align a synced deck's phase to the master musical clock (tempo match is separate).
-fn apply_phase_sync(deck: &mut DeckAudioState, master_beats: f64, master_bpm: f64, sample_rate: f32) {
-    if !deck.synced || deck.track_bpm <= 0.0 || deck.samples.is_empty() {
+fn apply_soft_sync(g: &mut EngineInner) {
+    let sr = g.sample_rate;
+
+    // If A synced and B has audio → lock A to B; if B synced and A has audio → lock B to A.
+    // Master need not be playing (paused playhead is still a valid phase reference).
+    if g.deck_a.synced && !g.deck_b.samples.is_empty() && g.deck_b.track_bpm > 0.0 {
+        soft_align(&mut g.deck_a, &g.deck_b, sr);
+    }
+    if g.deck_b.synced && !g.deck_a.samples.is_empty() && g.deck_a.track_bpm > 0.0 {
+        soft_align(&mut g.deck_b, &g.deck_a, sr);
+    }
+}
+
+fn soft_align(follower: &mut DeckAudioState, master: &DeckAudioState, sr: f32) {
+    if follower.track_bpm <= 0.0 || follower.samples.is_empty() {
         return;
     }
-    let pos_secs = deck.stretcher.read_pos() / deck.sample_rate.max(1) as f64;
-    let deck_beat = pos_secs * deck.track_bpm / 60.0;
-    let err = phase_error_beats(deck_beat, master_beats);
-    if err.abs() < 0.02 {
+    let master_pos_secs = master.stretcher.read_pos() / master.sample_rate.max(1) as f64;
+    let follower_pos_secs = follower.stretcher.read_pos() / follower.sample_rate.max(1) as f64;
+    let master_beat = beat_at_source(master_pos_secs, master.track_bpm, master.grid_offset_secs);
+    let follower_beat =
+        beat_at_source(follower_pos_secs, follower.track_bpm, follower.grid_offset_secs);
+    let err = phase_error_beats(follower_beat, master_beat);
+    if err.abs() < 0.004 {
         return;
     }
-    let nudge = sync_nudge_samples(err, master_bpm, sample_rate as u32);
-    deck.stretcher.nudge_frames(-(nudge as f64));
-    deck.read_frames = deck.stretcher.read_pos();
+    // Nudge is in *source* frames → convert with the follower's track BPM.
+    let nudge = soft_sync_nudge_samples(err, follower.track_bpm, sr as u32, 5.0);
+    if nudge == 0 {
+        return;
+    }
+    follower.stretcher.nudge_frames(-(nudge as f64));
+    follower.read_frames = follower.stretcher.read_pos();
 }

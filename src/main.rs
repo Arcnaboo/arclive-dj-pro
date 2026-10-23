@@ -9,6 +9,7 @@ mod library;
 mod mixer;
 mod settings;
 mod warp;
+mod win_drop;
 
 use anyhow::Result;
 use clap::Parser;

@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { Knob, Fader, Crossfader, MeterBar } from "controls.slint";
+import { Knob, Fader, Crossfader, MeterBar, KillButton } from "controls.slint";
 
 export component MixerStrip inherits Rectangle {
     in-out property <float> high-a: 0.5;
@@ -25,16 +25,26 @@ export component MixerStrip inherits Rectangle {
     in property <bool> cue-b: false;
     in-out property <float> cue-blend: 0.0;
     in-out property <float> headphone-vol: 0.8;
+    in property <bool> kill-high-a: false;
+    in property <bool> kill-mid-a: false;
+    in property <bool> kill-low-a: false;
+    in property <bool> kill-high-b: false;
+    in property <bool> kill-mid-b: false;
+    in property <bool> kill-low-b: false;
+    in property <bool> preview-in-master: false;
+    in property <bool> cue-available: false;
 
     callback param-changed();
     callback cue-a-toggled();
     callback cue-b-toggled();
+    callback kill-toggled(string);
+    callback preview-toggled();
 
     background: Theme.panel;
     border-radius: 6px;
     border-width: 1px;
     border-color: Theme.border;
-    height: 180px;
+    min-height: 220px;
 
     VerticalLayout {
         padding: 10px;
@@ -53,22 +63,36 @@ export component MixerStrip inherits Rectangle {
             spacing: 16px;
             alignment: center;
 
-            // Deck A column
             VerticalLayout {
                 spacing: 4px;
                 alignment: center;
                 Text { text: "DECK A"; color: Theme.deck-a; font-size: 10px; font-weight: 700; font-family: "Segoe UI"; horizontal-alignment: center; }
                 HorizontalLayout {
                     spacing: 4px;
-                    Knob { label: "HIGH"; value: high-a; accent: Theme.deck-a; changed(v) => { high-a = v; root.param-changed(); } }
-                    Knob { label: "MID"; value: mid-a; accent: Theme.deck-a; changed(v) => { mid-a = v; root.param-changed(); } }
-                    Knob { label: "LOW"; value: low-a; accent: Theme.deck-a; changed(v) => { low-a = v; root.param-changed(); } }
+                    VerticalLayout {
+                        spacing: 2px;
+                        alignment: center;
+                        Knob { label: "HIGH"; value: high-a; accent: Theme.deck-a; show-db: true; changed(v) => { high-a = v; root.param-changed(); } }
+                        KillButton { label: "K"; active: kill-high-a; toggled => { root.kill-toggled("high-a"); } }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        alignment: center;
+                        Knob { label: "MID"; value: mid-a; accent: Theme.deck-a; show-db: true; changed(v) => { mid-a = v; root.param-changed(); } }
+                        KillButton { label: "K"; active: kill-mid-a; toggled => { root.kill-toggled("mid-a"); } }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        alignment: center;
+                        Knob { label: "LOW"; value: low-a; accent: Theme.deck-a; show-db: true; changed(v) => { low-a = v; root.param-changed(); } }
+                        KillButton { label: "K"; active: kill-low-a; toggled => { root.kill-toggled("low-a"); } }
+                    }
                 }
                 HorizontalLayout {
                     spacing: 8px;
                     alignment: center;
-                    Knob { label: "FILTER"; value: filter-a; accent: Theme.deck-a; changed(v) => { filter-a = v; root.param-changed(); } }
-                    Knob { label: "GAIN"; value: gain-a; accent: Theme.deck-a; changed(v) => { gain-a = v; root.param-changed(); } }
+                    Knob { label: "FILTER"; value: filter-a; accent: Theme.deck-a; show-db: false; changed(v) => { filter-a = v; root.param-changed(); } }
+                    Knob { label: "GAIN"; value: gain-a; accent: Theme.deck-a; show-db: false; changed(v) => { gain-a = v; root.param-changed(); } }
                     Fader { value: fader-a; accent: Theme.deck-a; changed(v) => { fader-a = v; root.param-changed(); } }
                     MeterBar { level: meter-a; clipping: clip-a; }
                 }
@@ -83,7 +107,6 @@ export component MixerStrip inherits Rectangle {
                 }
             }
 
-            // Center
             VerticalLayout {
                 spacing: 8px;
                 alignment: center;
@@ -93,35 +116,66 @@ export component MixerStrip inherits Rectangle {
                 HorizontalLayout {
                     spacing: 12px;
                     alignment: center;
-                    MeterBar { level: meter-master; clipping: clip-master; height: 60px; }
+                    MeterBar { level: meter-master; clipping: clip-master; height: 80px; }
                     VerticalLayout {
                         spacing: 4px;
                         Text { text: "MASTER"; color: Theme.text-primary; font-size: 10px; font-weight: 700; font-family: "Segoe UI"; horizontal-alignment: center; }
                         Text { text: "HEADPHONE"; color: Theme.text-secondary; font-size: 9px; font-family: "Segoe UI"; horizontal-alignment: center; }
-                        Knob { label: "CUE/MST"; value: cue-blend; changed(v) => { cue-blend = v; root.param-changed(); } }
-                        Knob { label: "HP VOL"; value: headphone-vol; changed(v) => { headphone-vol = v; root.param-changed(); } }
+                        Knob { label: "CUE/MST"; value: cue-blend; show-db: false; changed(v) => { cue-blend = v; root.param-changed(); } }
+                        Knob { label: "HP VOL"; value: headphone-vol; show-db: false; changed(v) => { headphone-vol = v; root.param-changed(); } }
+                        if !cue-available: Rectangle {
+                            height: 22px;
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: preview-in-master ? Theme.warning : Theme.border;
+                            background: preview-in-master ? Theme.warning.with-alpha(0.2) : Theme.elevated;
+                            Text {
+                                text: preview-in-master ? "PREVIEW ON" : "PREVIEW";
+                                color: preview-in-master ? Theme.warning : Theme.text-secondary;
+                                font-size: 10px;
+                                font-weight: 700;
+                                font-family: "Segoe UI";
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea { clicked => { root.preview-toggled(); } }
+                        }
                     }
                 }
             }
 
-            // Deck B column
             VerticalLayout {
                 spacing: 4px;
                 alignment: center;
                 Text { text: "DECK B"; color: Theme.deck-b; font-size: 10px; font-weight: 700; font-family: "Segoe UI"; horizontal-alignment: center; }
                 HorizontalLayout {
                     spacing: 4px;
-                    Knob { label: "LOW"; value: low-b; accent: Theme.deck-b; changed(v) => { low-b = v; root.param-changed(); } }
-                    Knob { label: "MID"; value: mid-b; accent: Theme.deck-b; changed(v) => { mid-b = v; root.param-changed(); } }
-                    Knob { label: "HIGH"; value: high-b; accent: Theme.deck-b; changed(v) => { high-b = v; root.param-changed(); } }
+                    VerticalLayout {
+                        spacing: 2px;
+                        alignment: center;
+                        Knob { label: "LOW"; value: low-b; accent: Theme.deck-b; show-db: true; changed(v) => { low-b = v; root.param-changed(); } }
+                        KillButton { label: "K"; active: kill-low-b; toggled => { root.kill-toggled("low-b"); } }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        alignment: center;
+                        Knob { label: "MID"; value: mid-b; accent: Theme.deck-b; show-db: true; changed(v) => { mid-b = v; root.param-changed(); } }
+                        KillButton { label: "K"; active: kill-mid-b; toggled => { root.kill-toggled("mid-b"); } }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        alignment: center;
+                        Knob { label: "HIGH"; value: high-b; accent: Theme.deck-b; show-db: true; changed(v) => { high-b = v; root.param-changed(); } }
+                        KillButton { label: "K"; active: kill-high-b; toggled => { root.kill-toggled("high-b"); } }
+                    }
                 }
                 HorizontalLayout {
                     spacing: 8px;
                     alignment: center;
                     MeterBar { level: meter-b; clipping: clip-b; }
                     Fader { value: fader-b; accent: Theme.deck-b; changed(v) => { fader-b = v; root.param-changed(); } }
-                    Knob { label: "GAIN"; value: gain-b; accent: Theme.deck-b; changed(v) => { gain-b = v; root.param-changed(); } }
-                    Knob { label: "FILTER"; value: filter-b; accent: Theme.deck-b; changed(v) => { filter-b = v; root.param-changed(); } }
+                    Knob { label: "GAIN"; value: gain-b; accent: Theme.deck-b; show-db: false; changed(v) => { gain-b = v; root.param-changed(); } }
+                    Knob { label: "FILTER"; value: filter-b; accent: Theme.deck-b; show-db: false; changed(v) => { filter-b = v; root.param-changed(); } }
                 }
                 Rectangle {
                     height: 22px;

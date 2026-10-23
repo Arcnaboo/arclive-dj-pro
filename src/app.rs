@@ -4,14 +4,17 @@ use crate::audio::decoder::{decode_file, format_duration, resample_stereo, wavef
 use crate::audio::device::list_output_devices;
 use crate::audio::engine::{AudioEngine, DeckId, EngineCommand, SharedMeters};
 use crate::drop_target::{
-    cursor_client_pos, decide_drop, DropDecision, DropLayout, DropZone, Rect,
+    cursor_client_pos, decide_drop, physical_to_logical, DropAccumulator, DropDecision, DropLayout,
+    DropZone, Rect,
 };
 use crate::library::database::{default_db_path, LibraryDb, TrackRow};
 use crate::library::metadata::{file_stamp, track_row_from_meta};
 use crate::library::scanner::scan_folder;
 use crate::mixer::crossfader::CrossfaderCurve;
+use crate::mixer::eq::loop_region_frames;
 use crate::settings::config::{load_config, save_config, AppConfig};
 use crate::warp::markers::WarpMap;
+use crate::win_drop::{OleDropEvent, SharedDropLayout};
 use anyhow::Result;
 use parking_lot::Mutex;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
@@ -36,7 +39,13 @@ struct DeckUiState {
     peaks: Vec<f32>,
     overview: Vec<f32>,
     path: Option<PathBuf>,
+    track_id: Option<String>,
     loop_on: bool,
+    loop_start_norm: f32,
+    loop_end_norm: f32,
+    grid_offset: f64,
+    hot_cues: [bool; 8],
+    hot_cue_secs: [f64; 8],
 }
 
 impl Default for DeckUiState {
@@ -53,26 +62,58 @@ impl Default for DeckUiState {
             peaks: Vec::new(),
             overview: Vec::new(),
             path: None,
+            track_id: None,
             loop_on: false,
+            loop_start_norm: -1.0,
+            loop_end_norm: -1.0,
+            grid_offset: 0.0,
+            hot_cues: [false; 8],
+            hot_cue_secs: [0.0; 8],
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtxKind {
+    None,
+    Library,
+    WaveA,
+    WaveB,
+    DeckA,
+    DeckB,
 }
 
 struct AppState {
     config: AppConfig,
     layout: DropLayout,
+    shared_layout: SharedDropLayout,
     cursor: (f64, f64),
+    scale: f64,
     hover_paths: Vec<PathBuf>,
     hover_zone: DropZone,
+    drop_acc: DropAccumulator,
     deck_a: DeckUiState,
     deck_b: DeckUiState,
     cue_a: bool,
     cue_b: bool,
+    preview_in_master: bool,
+    kill_high_a: bool,
+    kill_mid_a: bool,
+    kill_low_a: bool,
+    kill_high_b: bool,
+    kill_mid_b: bool,
+    kill_low_b: bool,
     curve: CrossfaderCurve,
     tap_times: Vec<Instant>,
     last_hwnd: isize,
+    ole_active: bool,
     pending_load_a: Option<PathBuf>,
     pending_load_b: Option<PathBuf>,
+    ctx_kind: CtxKind,
+    ctx_index: i32,
+    ctx_wave_pos: f32,
+    drag_track_id: Option<String>,
+    drag_label: String,
 }
 
 pub struct ArcLiveApp {
@@ -92,12 +133,13 @@ impl ArcLiveApp {
         ui.set_load_protection(config.load_protection);
         ui.set_library_collapsed(config.library_collapsed);
         ui.set_crossfader_curve(config.crossfader_curve.clone().into());
+        ui.set_deck_a_hot_cues(ModelRc::new(VecModel::from(vec![false; 8])));
+        ui.set_deck_b_hot_cues(ModelRc::new(VecModel::from(vec![false; 8])));
 
         let engine = match AudioEngine::start(config.master_bpm) {
             Ok(e) => Arc::new(e),
             Err(e) => {
                 eprintln!("Audio engine failed to start: {e:#}");
-                // Still show UI; create a dummy? Better to fail soft with banner.
                 return Err(e);
             }
         };
@@ -119,21 +161,38 @@ impl ArcLiveApp {
             _ => CrossfaderCurve::EqualPower,
         };
 
+        let shared_layout = SharedDropLayout::new();
         let state = Arc::new(Mutex::new(AppState {
             config: config.clone(),
             layout: DropLayout::default(),
+            shared_layout: shared_layout.clone(),
             cursor: (0.0, 0.0),
+            scale: 1.0,
             hover_paths: Vec::new(),
             hover_zone: DropZone::None,
+            drop_acc: DropAccumulator::default(),
             deck_a: DeckUiState::default(),
             deck_b: DeckUiState::default(),
             cue_a: false,
             cue_b: false,
+            preview_in_master: false,
+            kill_high_a: false,
+            kill_mid_a: false,
+            kill_low_a: false,
+            kill_high_b: false,
+            kill_mid_b: false,
+            kill_low_b: false,
             curve,
             tap_times: Vec::new(),
             last_hwnd: 0,
+            ole_active: false,
             pending_load_a: None,
             pending_load_b: None,
+            ctx_kind: CtxKind::None,
+            ctx_index: -1,
+            ctx_wave_pos: 0.0,
+            drag_track_id: None,
+            drag_label: String::new(),
         }));
 
         let app = Self {
@@ -178,18 +237,82 @@ impl ArcLiveApp {
                     if let Some(path) = b {
                         load_path_on_deck(&ui_weak, &engine, &state, &db, DeckId::B, path);
                     }
-                    if let Some(ui) = ui_weak.upgrade() {
-                        ui.invoke_request_layout_sync();
-                    }
                 },
             );
             std::mem::forget(timer);
         }
 
         self.ui.run()?;
+        crate::win_drop::revoke_if_registered();
         let cfg = self.state.lock().config.clone();
         let _ = save_config(&cfg);
         Ok(())
+    }
+
+    fn publish_layout(state: &Arc<Mutex<AppState>>, ui: &AppWindow) {
+        let mut st = state.lock();
+        st.layout.deck_a = Rect {
+            x: ui.get_deck_a_x() as f64,
+            y: ui.get_deck_a_y() as f64,
+            w: ui.get_deck_a_w() as f64,
+            h: ui.get_deck_a_h() as f64,
+        };
+        st.layout.deck_b = Rect {
+            x: ui.get_deck_b_x() as f64,
+            y: ui.get_deck_b_y() as f64,
+            w: ui.get_deck_b_w() as f64,
+            h: ui.get_deck_b_h() as f64,
+        };
+        st.layout.library = Rect {
+            x: ui.get_library_x() as f64,
+            y: ui.get_library_y() as f64,
+            w: ui.get_library_w() as f64,
+            h: ui.get_library_h() as f64,
+        };
+        st.shared_layout.set_layout(st.layout.clone());
+        let scale = ui.window().scale_factor() as f64;
+        st.scale = scale;
+        st.shared_layout.set_scale(scale);
+    }
+
+    fn send_mixer(engine: &AudioEngine, ui: &AppWindow, state: &AppState) {
+        engine.send(EngineCommand::SetMixer {
+            high_a: ui.get_high_a(),
+            mid_a: ui.get_mid_a(),
+            low_a: ui.get_low_a(),
+            filter_a: ui.get_filter_a(),
+            gain_a: ui.get_gain_a(),
+            fader_a: ui.get_fader_a(),
+            high_b: ui.get_high_b(),
+            mid_b: ui.get_mid_b(),
+            low_b: ui.get_low_b(),
+            filter_b: ui.get_filter_b(),
+            gain_b: ui.get_gain_b(),
+            fader_b: ui.get_fader_b(),
+            crossfader: ui.get_crossfader(),
+            kill_low_a: state.kill_low_a,
+            kill_mid_a: state.kill_mid_a,
+            kill_high_a: state.kill_high_a,
+            kill_low_b: state.kill_low_b,
+            kill_mid_b: state.kill_mid_b,
+            kill_high_b: state.kill_high_b,
+        });
+        engine.send(EngineCommand::SetCue {
+            cue_a: state.cue_a,
+            cue_b: state.cue_b,
+            blend: ui.get_cue_blend(),
+            hp_vol: ui.get_headphone_vol(),
+            preview_in_master: state.preview_in_master,
+        });
+    }
+
+    fn open_ctx(ui: &AppWindow, state: &mut AppState, kind: CtxKind, x: f32, y: f32, items: Vec<&str>) {
+        state.ctx_kind = kind;
+        let model: Vec<SharedString> = items.into_iter().map(|s| s.into()).collect();
+        ui.set_ctx_items(ModelRc::new(VecModel::from(model)));
+        ui.set_ctx_x(x);
+        ui.set_ctx_y(y);
+        ui.set_ctx_open(true);
     }
 
     fn wire_callbacks(&self) {
@@ -202,47 +325,13 @@ impl ArcLiveApp {
             let engine = Arc::clone(&engine);
             let state = Arc::clone(&state);
             let ui_weak = ui.as_weak();
-            ui.on_play_a(move || {
-                let mut st = state.lock();
-                if !st.deck_a.can_play {
-                    return;
-                }
-                st.deck_a.playing = !st.deck_a.playing;
-                let playing = st.deck_a.playing;
-                drop(st);
-                if playing {
-                    engine.send(EngineCommand::Play(DeckId::A));
-                } else {
-                    engine.send(EngineCommand::Pause(DeckId::A));
-                }
-                if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_deck_a_playing(playing);
-                    ui.set_deck_a_status(if playing { "Playing".into() } else { "Paused".into() });
-                }
-            });
+            ui.on_play_a(move || toggle_play(&engine, &state, &ui_weak, DeckId::A));
         }
         {
             let engine = Arc::clone(&engine);
             let state = Arc::clone(&state);
             let ui_weak = ui.as_weak();
-            ui.on_play_b(move || {
-                let mut st = state.lock();
-                if !st.deck_b.can_play {
-                    return;
-                }
-                st.deck_b.playing = !st.deck_b.playing;
-                let playing = st.deck_b.playing;
-                drop(st);
-                if playing {
-                    engine.send(EngineCommand::Play(DeckId::B));
-                } else {
-                    engine.send(EngineCommand::Pause(DeckId::B));
-                }
-                if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_deck_b_playing(playing);
-                    ui.set_deck_b_status(if playing { "Playing".into() } else { "Paused".into() });
-                }
-            });
+            ui.on_play_b(move || toggle_play(&engine, &state, &ui_weak, DeckId::B));
         }
         {
             let engine = Arc::clone(&engine);
@@ -256,86 +345,25 @@ impl ArcLiveApp {
             let engine = Arc::clone(&engine);
             let state = Arc::clone(&state);
             let ui_weak = ui.as_weak();
-            ui.on_sync_a(move || {
-                let mut st = state.lock();
-                st.deck_a.synced = !st.deck_a.synced;
-                let synced = st.deck_a.synced;
-                drop(st);
-                engine.send(EngineCommand::SetSync {
-                    id: DeckId::A,
-                    synced,
-                });
-                if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_deck_a_synced(synced);
-                }
-            });
+            ui.on_sync_a(move || do_sync(&engine, &state, &ui_weak, DeckId::A));
         }
         {
             let engine = Arc::clone(&engine);
             let state = Arc::clone(&state);
             let ui_weak = ui.as_weak();
-            ui.on_sync_b(move || {
-                let mut st = state.lock();
-                st.deck_b.synced = !st.deck_b.synced;
-                let synced = st.deck_b.synced;
-                drop(st);
-                engine.send(EngineCommand::SetSync {
-                    id: DeckId::B,
-                    synced,
-                });
-                if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_deck_b_synced(synced);
-                }
-            });
+            ui.on_sync_b(move || do_sync(&engine, &state, &ui_weak, DeckId::B));
         }
         {
             let engine = Arc::clone(&engine);
             let state = Arc::clone(&state);
             let ui_weak = ui.as_weak();
-            ui.on_loop_a(move || {
-                let mut st = state.lock();
-                st.deck_a.loop_on = !st.deck_a.loop_on;
-                let on = st.deck_a.loop_on;
-                let sr = 48000.0;
-                let start = 0.0;
-                let end = (st.deck_a.duration * sr).max(sr);
-                drop(st);
-                engine.send(EngineCommand::SetLoop {
-                    id: DeckId::A,
-                    enabled: on,
-                    start,
-                    end: start + end.min(sr * 8.0),
-                });
-                if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_status_banner(
-                        if on {
-                            "Deck A loop on (8 bars approx)".into()
-                        } else {
-                            "Deck A loop off".into()
-                        },
-                    );
-                }
-            });
+            ui.on_loop_a(move || toggle_loop(&engine, &state, &ui_weak, DeckId::A, 8.0));
         }
         {
             let engine = Arc::clone(&engine);
             let state = Arc::clone(&state);
             let ui_weak = ui.as_weak();
-            ui.on_loop_b(move || {
-                let mut st = state.lock();
-                st.deck_b.loop_on = !st.deck_b.loop_on;
-                let on = st.deck_b.loop_on;
-                drop(st);
-                engine.send(EngineCommand::SetLoop {
-                    id: DeckId::B,
-                    enabled: on,
-                    start: 0.0,
-                    end: 48000.0 * 8.0,
-                });
-                if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_status_banner(if on { "Deck B loop on".into() } else { "Deck B loop off".into() });
-                }
-            });
+            ui.on_loop_b(move || toggle_loop(&engine, &state, &ui_weak, DeckId::B, 8.0));
         }
 
         {
@@ -345,14 +373,7 @@ impl ArcLiveApp {
             let db = Arc::clone(&db);
             ui.on_browse_a(move || {
                 if let Some(path) = native_open_audio() {
-                    load_path_on_deck(
-                        &ui_weak,
-                        &engine,
-                        &state,
-                        &db,
-                        DeckId::A,
-                        path,
-                    );
+                    load_path_on_deck(&ui_weak, &engine, &state, &db, DeckId::A, path);
                 }
             });
         }
@@ -363,44 +384,19 @@ impl ArcLiveApp {
             let db = Arc::clone(&db);
             ui.on_browse_b(move || {
                 if let Some(path) = native_open_audio() {
-                    load_path_on_deck(
-                        &ui_weak,
-                        &engine,
-                        &state,
-                        &db,
-                        DeckId::B,
-                        path,
-                    );
+                    load_path_on_deck(&ui_weak, &engine, &state, &db, DeckId::B, path);
                 }
             });
         }
 
         {
             let engine = Arc::clone(&engine);
+            let state = Arc::clone(&state);
             let ui_weak = ui.as_weak();
             ui.on_mixer_changed(move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    engine.send(EngineCommand::SetMixer {
-                        high_a: ui.get_high_a(),
-                        mid_a: ui.get_mid_a(),
-                        low_a: ui.get_low_a(),
-                        filter_a: ui.get_filter_a(),
-                        gain_a: ui.get_gain_a(),
-                        fader_a: ui.get_fader_a(),
-                        high_b: ui.get_high_b(),
-                        mid_b: ui.get_mid_b(),
-                        low_b: ui.get_low_b(),
-                        filter_b: ui.get_filter_b(),
-                        gain_b: ui.get_gain_b(),
-                        fader_b: ui.get_fader_b(),
-                        crossfader: ui.get_crossfader(),
-                    });
-                    engine.send(EngineCommand::SetCue {
-                        cue_a: ui.get_cue_a(),
-                        cue_b: ui.get_cue_b(),
-                        blend: ui.get_cue_blend(),
-                        hp_vol: ui.get_headphone_vol(),
-                    });
+                    let st = state.lock();
+                    Self::send_mixer(&engine, &ui, &st);
                 }
             });
         }
@@ -412,20 +408,22 @@ impl ArcLiveApp {
             ui.on_cue_a_toggle(move || {
                 let mut st = state.lock();
                 st.cue_a = !st.cue_a;
-                let v = st.cue_a;
+                let preview = st.preview_in_master;
+                let a = st.cue_a;
                 let b = st.cue_b;
                 drop(st);
                 if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_cue_a(v);
+                    ui.set_cue_a(a);
                     engine.send(EngineCommand::SetCue {
-                        cue_a: v,
+                        cue_a: a,
                         cue_b: b,
                         blend: ui.get_cue_blend(),
                         hp_vol: ui.get_headphone_vol(),
+                        preview_in_master: preview,
                     });
-                    if !ui.get_cue_available() {
+                    if !ui.get_cue_available() && !preview {
                         ui.set_status_banner(
-                            "No separate cue output — cue is not mixed into master.".into(),
+                            "No cue output — enable PREVIEW to hear cue in master.".into(),
                         );
                     }
                 }
@@ -438,17 +436,77 @@ impl ArcLiveApp {
             ui.on_cue_b_toggle(move || {
                 let mut st = state.lock();
                 st.cue_b = !st.cue_b;
-                let v = st.cue_b;
+                let preview = st.preview_in_master;
                 let a = st.cue_a;
+                let b = st.cue_b;
                 drop(st);
                 if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_cue_b(v);
+                    ui.set_cue_b(b);
                     engine.send(EngineCommand::SetCue {
                         cue_a: a,
-                        cue_b: v,
+                        cue_b: b,
                         blend: ui.get_cue_blend(),
                         hp_vol: ui.get_headphone_vol(),
+                        preview_in_master: preview,
                     });
+                }
+            });
+        }
+
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            let engine = Arc::clone(&engine);
+            ui.on_preview_toggled(move || {
+                let mut st = state.lock();
+                st.preview_in_master = !st.preview_in_master;
+                let v = st.preview_in_master;
+                let a = st.cue_a;
+                let b = st.cue_b;
+                drop(st);
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_preview_in_master(v);
+                    engine.send(EngineCommand::SetCue {
+                        cue_a: a,
+                        cue_b: b,
+                        blend: ui.get_cue_blend(),
+                        hp_vol: ui.get_headphone_vol(),
+                        preview_in_master: v,
+                    });
+                    ui.set_status_banner(
+                        if v {
+                            "Preview ON — cued decks audible in master.".into()
+                        } else {
+                            "Preview OFF.".into()
+                        },
+                    );
+                }
+            });
+        }
+
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            let engine = Arc::clone(&engine);
+            ui.on_kill_toggled(move |key| {
+                let mut st = state.lock();
+                match key.as_str() {
+                    "high-a" => st.kill_high_a = !st.kill_high_a,
+                    "mid-a" => st.kill_mid_a = !st.kill_mid_a,
+                    "low-a" => st.kill_low_a = !st.kill_low_a,
+                    "high-b" => st.kill_high_b = !st.kill_high_b,
+                    "mid-b" => st.kill_mid_b = !st.kill_mid_b,
+                    "low-b" => st.kill_low_b = !st.kill_low_b,
+                    _ => {}
+                }
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_kill_high_a(st.kill_high_a);
+                    ui.set_kill_mid_a(st.kill_mid_a);
+                    ui.set_kill_low_a(st.kill_low_a);
+                    ui.set_kill_high_b(st.kill_high_b);
+                    ui.set_kill_mid_b(st.kill_mid_b);
+                    ui.set_kill_low_b(st.kill_low_b);
+                    Self::send_mixer(&engine, &ui, &st);
                 }
             });
         }
@@ -489,6 +547,15 @@ impl ArcLiveApp {
                 }
             });
         }
+
+        {
+            let ui_weak = ui.as_weak();
+            ui.on_library_row_selected(move |idx| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_library_selected(idx);
+                }
+            });
+        }
         {
             let db = Arc::clone(&db);
             let ui_weak = ui.as_weak();
@@ -510,12 +577,110 @@ impl ArcLiveApp {
                     db.get_by_id(&id).ok().flatten().map(|t| PathBuf::from(t.path))
                 };
                 if let Some(path) = path {
-                    // Load to deck A by default on double semantics; single click selects
                     ui.set_library_selected(idx);
-                    load_path_on_deck(&ui_weak, &engine, &state, &db, DeckId::A, path);
+                    let st = state.lock();
+                    let target = if !st.deck_a.playing {
+                        DeckId::A
+                    } else if !st.deck_b.playing {
+                        DeckId::B
+                    } else {
+                        DeckId::A
+                    };
+                    drop(st);
+                    load_path_on_deck(&ui_weak, &engine, &state, &db, target, path);
                 }
             });
         }
+
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_library_row_context(move |idx, x, y| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let mut st = state.lock();
+                    st.ctx_index = idx;
+                    Self::open_ctx(
+                        &ui,
+                        &mut st,
+                        CtxKind::Library,
+                        x,
+                        y,
+                        vec![
+                            "Load Deck A",
+                            "Load Deck B",
+                            "Analyze",
+                            "Show in Explorer",
+                            "Remove from library",
+                        ],
+                    );
+                }
+            });
+        }
+
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_library_drag_begin(move |idx| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let tracks = ui.get_library_tracks();
+                    if idx < 0 || idx as usize >= tracks.row_count() {
+                        return;
+                    }
+                    let row = tracks.row_data(idx as usize).unwrap();
+                    let mut st = state.lock();
+                    st.drag_track_id = Some(row.id.to_string());
+                    st.drag_label = row.title.to_string();
+                    ui.set_lib_dragging(true);
+                    ui.set_lib_drag_label(row.title);
+                }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_library_drag_move(move |x, y| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_lib_drag_x(x);
+                    ui.set_lib_drag_y(y);
+                    let st = state.lock();
+                    let zone = st.layout.hit_test(x as f64, y as f64);
+                    drop(st);
+                    update_drop_hover(&ui_weak, zone);
+                }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            let engine = Arc::clone(&engine);
+            let db = Arc::clone(&db);
+            ui.on_library_drag_end(move |x, y| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_lib_dragging(false);
+                    update_drop_hover(&ui_weak, DropZone::None);
+                    let (id, zone) = {
+                        let mut st = state.lock();
+                        let id = st.drag_track_id.take();
+                        let zone = st.layout.hit_test(x as f64, y as f64);
+                        (id, zone)
+                    };
+                    if let Some(id) = id {
+                        if let (DropZone::DeckA | DropZone::DeckB, Some(path)) = (
+                            zone,
+                            db.lock().get_by_id(&id).ok().flatten().map(|t| PathBuf::from(t.path)),
+                        ) {
+                            let deck = if zone == DropZone::DeckA {
+                                DeckId::A
+                            } else {
+                                DeckId::B
+                            };
+                            load_path_on_deck(&ui_weak, &engine, &state, &db, deck, path);
+                        }
+                    }
+                }
+            });
+        }
+
         {
             let state = Arc::clone(&state);
             let ui_weak = ui.as_weak();
@@ -612,57 +777,204 @@ impl ArcLiveApp {
             let ui_weak = ui.as_weak();
             ui.on_request_layout_sync(move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    // Approximate layout from window size (matches padding/spacing in app.slint).
-                    let size = ui.window().size();
-                    let scale = ui.window().scale_factor() as f64;
-                    let w = size.width as f64 / scale;
-                    let h = size.height as f64 / scale;
-                    let pad = 12.0;
-                    let gap = 10.0;
-                    let toolbar = 40.0;
-                    let mixer = 180.0;
-                    let lib_h = if ui.get_library_collapsed() {
-                        36.0
-                    } else {
-                        (h * 0.22).clamp(160.0, 280.0)
-                    };
-                    let content_top = pad + toolbar + gap;
-                    let lib_y = h - pad - lib_h;
-                    let mixer_y = lib_y - gap - mixer;
-                    let deck_h = (mixer_y - gap - content_top).max(120.0);
-                    let deck_w = (w - pad * 2.0 - gap) / 2.0;
-                    let mut st = state.lock();
-                    st.layout.deck_a = Rect {
-                        x: pad,
-                        y: content_top,
-                        w: deck_w,
-                        h: deck_h,
-                    };
-                    st.layout.deck_b = Rect {
-                        x: pad + deck_w + gap,
-                        y: content_top,
-                        w: deck_w,
-                        h: deck_h,
-                    };
-                    st.layout.library = Rect {
-                        x: pad,
-                        y: lib_y,
-                        w: w - pad * 2.0,
-                        h: lib_h,
-                    };
-                    ui.set_deck_a_x(st.layout.deck_a.x as f32);
-                    ui.set_deck_a_y(st.layout.deck_a.y as f32);
-                    ui.set_deck_a_w(st.layout.deck_a.w as f32);
-                    ui.set_deck_a_h(st.layout.deck_a.h as f32);
-                    ui.set_deck_b_x(st.layout.deck_b.x as f32);
-                    ui.set_deck_b_y(st.layout.deck_b.y as f32);
-                    ui.set_deck_b_w(st.layout.deck_b.w as f32);
-                    ui.set_deck_b_h(st.layout.deck_b.h as f32);
-                    ui.set_library_x(st.layout.library.x as f32);
-                    ui.set_library_y(st.layout.library.y as f32);
-                    ui.set_library_w(st.layout.library.w as f32);
-                    ui.set_library_h(st.layout.library.h as f32);
+                    Self::publish_layout(&state, &ui);
                 }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_deck_a_geometry(move |x, y, w, h| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_deck_a_x(x);
+                    ui.set_deck_a_y(y);
+                    ui.set_deck_a_w(w);
+                    ui.set_deck_a_h(h);
+                    Self::publish_layout(&state, &ui);
+                }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_deck_b_geometry(move |x, y, w, h| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_deck_b_x(x);
+                    ui.set_deck_b_y(y);
+                    ui.set_deck_b_w(w);
+                    ui.set_deck_b_h(h);
+                    Self::publish_layout(&state, &ui);
+                }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_library_geometry(move |x, y, w, h| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_library_x(x);
+                    ui.set_library_y(y);
+                    ui.set_library_w(w);
+                    ui.set_library_h(h);
+                    Self::publish_layout(&state, &ui);
+                }
+            });
+        }
+
+        // Seek / jump / nudge / hot cues
+        wire_seek(ui, &engine, &state, DeckId::A);
+        wire_seek(ui, &engine, &state, DeckId::B);
+        {
+            let engine = Arc::clone(&engine);
+            ui.on_beat_jump_a(move |b| {
+                engine.send(EngineCommand::BeatJump {
+                    id: DeckId::A,
+                    beats: b as f64,
+                })
+            });
+        }
+        {
+            let engine = Arc::clone(&engine);
+            ui.on_beat_jump_b(move |b| {
+                engine.send(EngineCommand::BeatJump {
+                    id: DeckId::B,
+                    beats: b as f64,
+                })
+            });
+        }
+        {
+            let engine = Arc::clone(&engine);
+            ui.on_nudge_a(move |on| {
+                engine.send(EngineCommand::SetTempoBend {
+                    id: DeckId::A,
+                    bend: if on { 0.02 } else { 0.0 },
+                })
+            });
+        }
+        {
+            let engine = Arc::clone(&engine);
+            ui.on_nudge_b(move |on| {
+                engine.send(EngineCommand::SetTempoBend {
+                    id: DeckId::B,
+                    bend: if on { 0.02 } else { 0.0 },
+                })
+            });
+        }
+        wire_hot_cue(ui, &engine, &state, &db, DeckId::A);
+        wire_hot_cue(ui, &engine, &state, &db, DeckId::B);
+
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_deck_a_context(move |x, y| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let mut st = state.lock();
+                    Self::open_ctx(
+                        &ui,
+                        &mut st,
+                        CtxKind::DeckA,
+                        x,
+                        y,
+                        vec![
+                            "Unload",
+                            "Half tempo",
+                            "Double tempo",
+                            "Use BPM as master",
+                            "Shift grid earlier",
+                            "Shift grid later",
+                        ],
+                    );
+                }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_deck_b_context(move |x, y| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let mut st = state.lock();
+                    Self::open_ctx(
+                        &ui,
+                        &mut st,
+                        CtxKind::DeckB,
+                        x,
+                        y,
+                        vec![
+                            "Unload",
+                            "Half tempo",
+                            "Double tempo",
+                            "Use BPM as master",
+                            "Shift grid earlier",
+                            "Shift grid later",
+                        ],
+                    );
+                }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_wave_a_context(move |p, x, y| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let mut st = state.lock();
+                    st.ctx_wave_pos = p;
+                    Self::open_ctx(
+                        &ui,
+                        &mut st,
+                        CtxKind::WaveA,
+                        x,
+                        y,
+                        vec![
+                            "Set cue here",
+                            "Jump here",
+                            "Loop 4 beats",
+                            "Loop 8 beats",
+                            "Clear loop",
+                        ],
+                    );
+                }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            ui.on_wave_b_context(move |p, x, y| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let mut st = state.lock();
+                    st.ctx_wave_pos = p;
+                    Self::open_ctx(
+                        &ui,
+                        &mut st,
+                        CtxKind::WaveB,
+                        x,
+                        y,
+                        vec![
+                            "Set cue here",
+                            "Jump here",
+                            "Loop 4 beats",
+                            "Loop 8 beats",
+                            "Clear loop",
+                        ],
+                    );
+                }
+            });
+        }
+
+        {
+            let ui_weak = ui.as_weak();
+            ui.on_ctx_dismiss(move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_ctx_open(false);
+                }
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let ui_weak = ui.as_weak();
+            let engine = Arc::clone(&engine);
+            let db = Arc::clone(&db);
+            ui.on_ctx_action(move |idx| {
+                handle_ctx_action(&ui_weak, &engine, &state, &db, idx);
             });
         }
     }
@@ -675,30 +987,152 @@ impl ArcLiveApp {
         let engine = Arc::clone(&self.engine);
         let db = Arc::clone(&self.db);
 
+        // HWND capture + OLE registration (timer kept alive).
+        #[cfg(windows)]
+        {
+            let state = Arc::clone(&self.state);
+            let ui_weak = self.ui.as_weak();
+            let engine = Arc::clone(&self.engine);
+            let db = Arc::clone(&self.db);
+            let timer = slint::Timer::default();
+            timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(400),
+                move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.window().with_winit_window(|winit_window| {
+                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                            if let Ok(handle) = winit_window.window_handle() {
+                                if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                                    let hwnd = h.hwnd.get() as isize;
+                                    let mut st = state.lock();
+                                    if st.last_hwnd != hwnd {
+                                        st.last_hwnd = hwnd;
+                                    }
+                                    if !st.ole_active && hwnd != 0 {
+                                        let layout = st.shared_layout.clone();
+                                        let ui_weak2 = ui_weak.clone();
+                                        let engine2 = Arc::clone(&engine);
+                                        let state2 = Arc::clone(&state);
+                                        let db2 = Arc::clone(&db);
+                                        let cb: crate::win_drop::OleDropCallback =
+                                            Arc::new(move |ev| {
+                                                let ui_weak = ui_weak2.clone();
+                                                let engine = Arc::clone(&engine2);
+                                                let state = Arc::clone(&state2);
+                                                let db = Arc::clone(&db2);
+                                                let _ = slint::invoke_from_event_loop(move || {
+                                                    handle_ole_event(
+                                                        &ui_weak, &engine, &state, &db, ev,
+                                                    );
+                                                });
+                                            });
+                                        if crate::win_drop::try_register(hwnd, layout, cb) {
+                                            st.ole_active = true;
+                                            eprintln!("OLE IDropTarget registered");
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        ArcLiveApp::publish_layout(&state, &ui);
+                    }
+
+                    // Flush coalesced winit multi-file drops.
+                    let ready = {
+                        let st = state.lock();
+                        !st.ole_active && st.drop_acc.ready(Duration::from_millis(40))
+                    };
+                    if ready {
+                        let (zone, paths, playing, protection) = {
+                            let mut st = state.lock();
+                            let Some((zone, paths, _)) = st.drop_acc.take() else {
+                                return;
+                            };
+                            let playing = match zone {
+                                DropZone::DeckA => st.deck_a.playing,
+                                DropZone::DeckB => st.deck_b.playing,
+                                _ => false,
+                            };
+                            let protection = st.config.load_protection;
+                            (zone, paths, playing, protection)
+                        };
+                        update_drop_hover(&ui_weak, DropZone::None);
+                        handle_drop_decision(
+                            &ui_weak,
+                            &engine,
+                            &state,
+                            &db,
+                            decide_drop(zone, &paths, playing, protection),
+                        );
+                    }
+                },
+            );
+            std::mem::forget(timer);
+        }
+
         self.ui.window().on_winit_window_event(move |_win, event| {
             use slint::winit_030::winit::event::WindowEvent;
+            let ole = state.lock().ole_active;
             match event {
                 WindowEvent::CursorMoved { position, .. } => {
                     let mut st = state.lock();
                     st.cursor = (position.x, position.y);
+                    let dragging = st.drag_track_id.is_some();
+                    let scale = st.scale;
+                    drop(st);
+                    if dragging {
+                        let (lx, ly) = physical_to_logical(position.x, position.y, scale);
+                        if let Some(ui) = ui_weak.upgrade() {
+                            ui.set_lib_drag_x(lx as f32);
+                            ui.set_lib_drag_y(ly as f32);
+                        }
+                        let zone = {
+                            let st = state.lock();
+                            st.layout.hit_test(lx, ly)
+                        };
+                        update_drop_hover(&ui_weak, zone);
+                    }
                     EventResult::Propagate
                 }
-                WindowEvent::HoveredFile(path) => {
+                WindowEvent::MouseInput {
+                    state: btn_state,
+                    button,
+                    ..
+                } => {
+                    use slint::winit_030::winit::event::{ElementState, MouseButton};
+                    if button == &MouseButton::Left && btn_state == &ElementState::Released {
+                        let (id, cursor, scale) = {
+                            let st = state.lock();
+                            (st.drag_track_id.clone(), st.cursor, st.scale)
+                        };
+                        if id.is_some() {
+                            let (lx, ly) = physical_to_logical(cursor.0, cursor.1, scale);
+                            // Reuse the Slint drag-end path.
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.invoke_library_drag_end(lx as f32, ly as f32);
+                            }
+                        }
+                    }
+                    EventResult::Propagate
+                }
+                WindowEvent::HoveredFile(path) if !ole => {
                     let mut st = state.lock();
                     if !st.hover_paths.contains(path) {
                         st.hover_paths.push(path.clone());
                     }
-                    // Refresh cursor from Win32 for accurate hit-test during OS drag.
                     if let Some((x, y)) = cursor_client_pos(st.last_hwnd) {
                         st.cursor = (x, y);
                     }
-                    let zone = st.layout.hit_test(st.cursor.0, st.cursor.1);
+                    let zone = st
+                        .layout
+                        .hit_test_physical(st.cursor.0, st.cursor.1, st.scale);
                     st.hover_zone = zone;
                     drop(st);
                     update_drop_hover(&ui_weak, zone);
                     EventResult::PreventDefault
                 }
-                WindowEvent::HoveredFileCancelled => {
+                WindowEvent::HoveredFileCancelled if !ole => {
                     {
                         let mut st = state.lock();
                         st.hover_paths.clear();
@@ -707,63 +1141,25 @@ impl ArcLiveApp {
                     update_drop_hover(&ui_weak, DropZone::None);
                     EventResult::PreventDefault
                 }
-                WindowEvent::DroppedFile(path) => {
-                    let (zone, paths, playing, protection) = {
-                        let mut st = state.lock();
-                        if let Some((x, y)) = cursor_client_pos(st.last_hwnd) {
-                            st.cursor = (x, y);
-                        }
-                        if !st.hover_paths.iter().any(|p| p == path) {
-                            st.hover_paths.push(path.clone());
-                        }
-                        let zone = st.layout.hit_test(st.cursor.0, st.cursor.1);
-                        let paths = st.hover_paths.clone();
-                        st.hover_paths.clear();
-                        st.hover_zone = DropZone::None;
-                        let playing = match zone {
-                            DropZone::DeckA => st.deck_a.playing,
-                            DropZone::DeckB => st.deck_b.playing,
-                            _ => false,
-                        };
-                        let protection = st.config.load_protection;
-                        (zone, paths, playing, protection)
-                    };
-                    update_drop_hover(&ui_weak, DropZone::None);
-                    handle_drop_decision(
-                        &ui_weak,
-                        &engine,
-                        &state,
-                        &db,
-                        decide_drop(zone, &paths, playing, protection),
-                    );
+                WindowEvent::DroppedFile(path) if !ole => {
+                    let mut st = state.lock();
+                    if let Some((x, y)) = cursor_client_pos(st.last_hwnd) {
+                        st.cursor = (x, y);
+                    }
+                    let (lx, ly) = physical_to_logical(st.cursor.0, st.cursor.1, st.scale);
+                    let zone = st.layout.hit_test(lx, ly);
+                    st.drop_acc.push(path.clone(), zone, (lx, ly));
+                    // Also merge any hover_paths accumulated
+                    let pending = std::mem::take(&mut st.hover_paths);
+                    for p in pending {
+                        st.drop_acc.push(p, zone, (lx, ly));
+                    }
+                    st.hover_zone = DropZone::None;
                     EventResult::PreventDefault
                 }
                 _ => EventResult::Propagate,
             }
         });
-
-        // Capture HWND for ScreenToClient
-        #[cfg(windows)]
-        {
-            let state = Arc::clone(&self.state);
-            let ui_weak = self.ui.as_weak();
-            slint::Timer::default().start(
-                slint::TimerMode::Repeated,
-                Duration::from_millis(500),
-                move || {
-                    if let Some(ui) = ui_weak.upgrade() {
-                        ui.window().with_winit_window(|winit_window| {
-                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                            if let Ok(handle) = winit_window.window_handle() {
-                                if let RawWindowHandle::Win32(h) = handle.as_raw() {
-                                    state.lock().last_hwnd = h.hwnd.get() as isize;
-                                }
-                            }
-                        });
-                    }
-                },
-            );
-        }
     }
 
     fn start_ui_timer(&self) {
@@ -799,8 +1195,583 @@ impl ArcLiveApp {
                 }
             },
         );
-        // Keep timer alive by leaking (slint timer needs ownership) — store on UI via forget
         std::mem::forget(timer);
+    }
+}
+
+fn toggle_play(
+    engine: &AudioEngine,
+    state: &Arc<Mutex<AppState>>,
+    ui_weak: &Weak<AppWindow>,
+    id: DeckId,
+) {
+    let mut st = state.lock();
+    let deck = match id {
+        DeckId::A => &mut st.deck_a,
+        DeckId::B => &mut st.deck_b,
+    };
+    if !deck.can_play {
+        return;
+    }
+    deck.playing = !deck.playing;
+    let playing = deck.playing;
+    drop(st);
+    if playing {
+        engine.send(EngineCommand::Play(id));
+    } else {
+        engine.send(EngineCommand::Pause(id));
+    }
+    if let Some(ui) = ui_weak.upgrade() {
+        match id {
+            DeckId::A => {
+                ui.set_deck_a_playing(playing);
+                ui.set_deck_a_status(if playing { "Playing".into() } else { "Paused".into() });
+            }
+            DeckId::B => {
+                ui.set_deck_b_playing(playing);
+                ui.set_deck_b_status(if playing { "Playing".into() } else { "Paused".into() });
+            }
+        }
+    }
+}
+
+fn do_sync(
+    engine: &AudioEngine,
+    state: &Arc<Mutex<AppState>>,
+    ui_weak: &Weak<AppWindow>,
+    follower: DeckId,
+) {
+    let mut st = state.lock();
+    let deck = match follower {
+        DeckId::A => &mut st.deck_a,
+        DeckId::B => &mut st.deck_b,
+    };
+    if !deck.can_play {
+        return;
+    }
+    if deck.synced {
+        deck.synced = false;
+        drop(st);
+        engine.send(EngineCommand::SetSync {
+            id: follower,
+            synced: false,
+        });
+        if let Some(ui) = ui_weak.upgrade() {
+            match follower {
+                DeckId::A => ui.set_deck_a_synced(false),
+                DeckId::B => ui.set_deck_b_synced(false),
+            }
+            ui.set_status_banner("Sync off.".into());
+        }
+        return;
+    }
+    deck.synced = true;
+    drop(st);
+    engine.send(EngineCommand::SyncLock { follower });
+    if let Some(ui) = ui_weak.upgrade() {
+        match follower {
+            DeckId::A => ui.set_deck_a_synced(true),
+            DeckId::B => ui.set_deck_b_synced(true),
+        }
+        ui.set_status_banner("Sync: phase locked to the other deck.".into());
+    }
+}
+
+fn toggle_loop(
+    engine: &AudioEngine,
+    state: &Arc<Mutex<AppState>>,
+    ui_weak: &Weak<AppWindow>,
+    id: DeckId,
+    beats: f64,
+) {
+    let mut st = state.lock();
+    let deck = match id {
+        DeckId::A => &mut st.deck_a,
+        DeckId::B => &mut st.deck_b,
+    };
+    if !deck.can_play || deck.bpm <= 0.0 || deck.duration <= 0.0 {
+        return;
+    }
+    deck.loop_on = !deck.loop_on;
+    let on = deck.loop_on;
+    let sr = 48000.0f32;
+    let playhead = engine.deck_position_frames(id);
+    let (start, end) = if on {
+        loop_region_frames(playhead, deck.bpm, sr, beats)
+    } else {
+        (0.0, 0.0)
+    };
+    let dur_frames = deck.duration * sr as f64;
+    if on && dur_frames > 0.0 {
+        deck.loop_start_norm = (start / dur_frames) as f32;
+        deck.loop_end_norm = (end / dur_frames) as f32;
+    } else {
+        deck.loop_start_norm = -1.0;
+        deck.loop_end_norm = -1.0;
+    }
+    let ls = deck.loop_start_norm;
+    let le = deck.loop_end_norm;
+    drop(st);
+    engine.send(EngineCommand::SetLoop {
+        id,
+        enabled: on,
+        start,
+        end,
+    });
+    if let Some(ui) = ui_weak.upgrade() {
+        match id {
+            DeckId::A => {
+                ui.set_deck_a_loop_on(on);
+                ui.set_deck_a_loop_start(ls);
+                ui.set_deck_a_loop_end(le);
+            }
+            DeckId::B => {
+                ui.set_deck_b_loop_on(on);
+                ui.set_deck_b_loop_start(ls);
+                ui.set_deck_b_loop_end(le);
+            }
+        }
+    }
+}
+
+fn wire_seek(ui: &AppWindow, engine: &Arc<AudioEngine>, state: &Arc<Mutex<AppState>>, id: DeckId) {
+    let engine = Arc::clone(engine);
+    let state = Arc::clone(state);
+    match id {
+        DeckId::A => {
+            ui.on_seek_a(move |p| {
+                let st = state.lock();
+                let frames = p as f64 * st.deck_a.duration * 48000.0;
+                drop(st);
+                engine.send(EngineCommand::Seek {
+                    id: DeckId::A,
+                    frames,
+                });
+            });
+        }
+        DeckId::B => {
+            ui.on_seek_b(move |p| {
+                let st = state.lock();
+                let frames = p as f64 * st.deck_b.duration * 48000.0;
+                drop(st);
+                engine.send(EngineCommand::Seek {
+                    id: DeckId::B,
+                    frames,
+                });
+            });
+        }
+    }
+}
+
+fn wire_hot_cue(
+    ui: &AppWindow,
+    engine: &Arc<AudioEngine>,
+    state: &Arc<Mutex<AppState>>,
+    db: &Arc<Mutex<LibraryDb>>,
+    id: DeckId,
+) {
+    let engine = Arc::clone(engine);
+    let state = Arc::clone(state);
+    let db = Arc::clone(db);
+    let ui_weak = ui.as_weak();
+    let handler = move |slot: i32, shift: bool| {
+        let mut st = state.lock();
+        let deck = match id {
+            DeckId::A => &mut st.deck_a,
+            DeckId::B => &mut st.deck_b,
+        };
+        if !deck.can_play {
+            return;
+        }
+        let sr = engine.sample_rate() as f64;
+        if shift {
+            let pos = engine.deck_position_frames(id) / sr;
+            let s = slot as usize;
+            if s < 8 {
+                deck.hot_cues[s] = true;
+                deck.hot_cue_secs[s] = pos;
+                if let Some(tid) = deck.track_id.clone() {
+                    let _ = db.lock().set_hot_cue(&tid, slot as i64, pos, &format!("Cue {}", slot + 1));
+                }
+                let flags: Vec<bool> = deck.hot_cues.to_vec();
+                drop(st);
+                if let Some(ui) = ui_weak.upgrade() {
+                    let model = ModelRc::new(VecModel::from(flags));
+                    match id {
+                        DeckId::A => ui.set_deck_a_hot_cues(model),
+                        DeckId::B => ui.set_deck_b_hot_cues(model),
+                    }
+                }
+            }
+        } else {
+            let s = slot as usize;
+            if s < 8 && deck.hot_cues[s] {
+                let frames = deck.hot_cue_secs[s] * sr;
+                drop(st);
+                engine.send(EngineCommand::Seek { id, frames });
+            }
+        }
+    };
+    match id {
+        DeckId::A => ui.on_hot_cue_a(handler),
+        DeckId::B => ui.on_hot_cue_b(handler),
+    }
+}
+
+fn handle_ole_event(
+    ui_weak: &Weak<AppWindow>,
+    engine: &Arc<AudioEngine>,
+    state: &Arc<Mutex<AppState>>,
+    db: &Arc<Mutex<LibraryDb>>,
+    ev: OleDropEvent,
+) {
+    match ev {
+        OleDropEvent::Hover { zone, .. } => update_drop_hover(ui_weak, zone),
+        OleDropEvent::Leave => update_drop_hover(ui_weak, DropZone::None),
+        OleDropEvent::Drop { zone, paths, client_x, client_y } => {
+            let (zone, playing, protection) = {
+                let mut st = state.lock();
+                let scale = st.scale;
+                let (lx, ly) = physical_to_logical(client_x, client_y, scale);
+                // Prefer live layout hit over OLE-reported zone (OLE already hit-tested physical).
+                let z = if zone != DropZone::None {
+                    zone
+                } else {
+                    st.layout.hit_test(lx, ly)
+                };
+                let playing = match z {
+                    DropZone::DeckA => st.deck_a.playing,
+                    DropZone::DeckB => st.deck_b.playing,
+                    _ => false,
+                };
+                (z, playing, st.config.load_protection)
+            };
+            update_drop_hover(ui_weak, DropZone::None);
+            handle_drop_decision(
+                ui_weak,
+                engine,
+                state,
+                db,
+                decide_drop(zone, &paths, playing, protection),
+            );
+        }
+    }
+}
+
+fn handle_ctx_action(
+    ui_weak: &Weak<AppWindow>,
+    engine: &Arc<AudioEngine>,
+    state: &Arc<Mutex<AppState>>,
+    db: &Arc<Mutex<LibraryDb>>,
+    idx: i32,
+) {
+    let Some(ui) = ui_weak.upgrade() else {
+        return;
+    };
+    ui.set_ctx_open(false);
+    let (kind, row_idx, wave_pos) = {
+        let st = state.lock();
+        (st.ctx_kind, st.ctx_index, st.ctx_wave_pos)
+    };
+
+    match kind {
+        CtxKind::Library => {
+            let tracks = ui.get_library_tracks();
+            if row_idx < 0 || row_idx as usize >= tracks.row_count() {
+                return;
+            }
+            let row = tracks.row_data(row_idx as usize).unwrap();
+            let id = row.id.to_string();
+            let path = db.lock().get_by_id(&id).ok().flatten().map(|t| PathBuf::from(t.path));
+            match idx {
+                0 => {
+                    if let Some(p) = path {
+                        load_path_on_deck(ui_weak, engine, state, db, DeckId::A, p);
+                    }
+                }
+                1 => {
+                    if let Some(p) = path {
+                        load_path_on_deck(ui_weak, engine, state, db, DeckId::B, p);
+                    }
+                }
+                2 => {
+                    if let Some(p) = path {
+                        // Re-analyze by loading to a free deck temporarily via import
+                        import_paths(ui_weak, db, &[p]);
+                    }
+                }
+                3 => {
+                    if let Some(p) = path {
+                        #[cfg(windows)]
+                        {
+                            let _ = std::process::Command::new("explorer")
+                                .args(["/select,", &p.to_string_lossy()])
+                                .spawn();
+                        }
+                    }
+                }
+                4 => {
+                    let _ = db.lock().remove_track(&id);
+                    refresh_library(&ui, db, ui.get_library_search().as_str());
+                }
+                _ => {}
+            }
+        }
+        CtxKind::WaveA | CtxKind::WaveB => {
+            let id = if kind == CtxKind::WaveA {
+                DeckId::A
+            } else {
+                DeckId::B
+            };
+            let st = state.lock();
+            let deck = if kind == CtxKind::WaveA {
+                &st.deck_a
+            } else {
+                &st.deck_b
+            };
+            let dur = deck.duration;
+            let bpm = deck.bpm;
+            let sr = engine.sample_rate();
+            drop(st);
+            match idx {
+                0 => {
+                    let frames = wave_pos as f64 * dur * sr as f64;
+                    engine.send(EngineCommand::SetCuePoint { id, frames });
+                    ui.set_status_banner("Cue point set.".into());
+                }
+                1 => {
+                    let frames = wave_pos as f64 * dur * sr as f64;
+                    engine.send(EngineCommand::Seek { id, frames });
+                }
+                2 => set_loop_beats(engine, state, ui_weak, id, 4.0),
+                3 => set_loop_beats(engine, state, ui_weak, id, 8.0),
+                4 => {
+                    engine.send(EngineCommand::SetLoop {
+                        id,
+                        enabled: false,
+                        start: 0.0,
+                        end: 0.0,
+                    });
+                    let mut st = state.lock();
+                    let deck = match id {
+                        DeckId::A => &mut st.deck_a,
+                        DeckId::B => &mut st.deck_b,
+                    };
+                    deck.loop_on = false;
+                    deck.loop_start_norm = -1.0;
+                    deck.loop_end_norm = -1.0;
+                    drop(st);
+                    match id {
+                        DeckId::A => {
+                            ui.set_deck_a_loop_on(false);
+                            ui.set_deck_a_loop_start(-1.0);
+                            ui.set_deck_a_loop_end(-1.0);
+                        }
+                        DeckId::B => {
+                            ui.set_deck_b_loop_on(false);
+                            ui.set_deck_b_loop_start(-1.0);
+                            ui.set_deck_b_loop_end(-1.0);
+                        }
+                    }
+                    let _ = bpm;
+                }
+                _ => {}
+            }
+        }
+        CtxKind::DeckA | CtxKind::DeckB => {
+            let id = if kind == CtxKind::DeckA {
+                DeckId::A
+            } else {
+                DeckId::B
+            };
+            match idx {
+                0 => unload_deck(engine, state, ui_weak, id),
+                1 => half_double_tempo(engine, state, ui_weak, id, 0.5),
+                2 => half_double_tempo(engine, state, ui_weak, id, 2.0),
+                3 => {
+                    let bpm = {
+                        let st = state.lock();
+                        match id {
+                            DeckId::A => st.deck_a.bpm,
+                            DeckId::B => st.deck_b.bpm,
+                        }
+                    };
+                    if bpm > 0.0 {
+                        let mut st = state.lock();
+                        st.config.master_bpm = bpm;
+                        drop(st);
+                        engine.send(EngineCommand::SetMasterBpm(bpm));
+                        ui.set_master_bpm(bpm as f32);
+                        ui.set_master_bpm_text(format!("{bpm:.2}").into());
+                    }
+                }
+                4 => shift_grid(engine, state, ui_weak, id, -0.01),
+                5 => shift_grid(engine, state, ui_weak, id, 0.01),
+                _ => {}
+            }
+        }
+        CtxKind::None => {}
+    }
+}
+
+fn set_loop_beats(
+    engine: &AudioEngine,
+    state: &Arc<Mutex<AppState>>,
+    ui_weak: &Weak<AppWindow>,
+    id: DeckId,
+    beats: f64,
+) {
+    let mut st = state.lock();
+    let deck = match id {
+        DeckId::A => &mut st.deck_a,
+        DeckId::B => &mut st.deck_b,
+    };
+    deck.loop_on = false; // force on
+    drop(st);
+    // turn on
+    let mut st = state.lock();
+    let deck = match id {
+        DeckId::A => &mut st.deck_a,
+        DeckId::B => &mut st.deck_b,
+    };
+    deck.loop_on = true;
+    let sr = engine.sample_rate();
+    let playhead = engine.deck_position_frames(id);
+    let (start, end) = loop_region_frames(playhead, deck.bpm, sr, beats);
+    let dur_frames = deck.duration * sr as f64;
+    if dur_frames > 0.0 {
+        deck.loop_start_norm = (start / dur_frames) as f32;
+        deck.loop_end_norm = (end / dur_frames) as f32;
+    }
+    let ls = deck.loop_start_norm;
+    let le = deck.loop_end_norm;
+    drop(st);
+    engine.send(EngineCommand::SetLoop {
+        id,
+        enabled: true,
+        start,
+        end,
+    });
+    if let Some(ui) = ui_weak.upgrade() {
+        match id {
+            DeckId::A => {
+                ui.set_deck_a_loop_on(true);
+                ui.set_deck_a_loop_start(ls);
+                ui.set_deck_a_loop_end(le);
+            }
+            DeckId::B => {
+                ui.set_deck_b_loop_on(true);
+                ui.set_deck_b_loop_start(ls);
+                ui.set_deck_b_loop_end(le);
+            }
+        }
+    }
+}
+
+fn unload_deck(
+    engine: &AudioEngine,
+    state: &Arc<Mutex<AppState>>,
+    ui_weak: &Weak<AppWindow>,
+    id: DeckId,
+) {
+    engine.send(EngineCommand::Unload(id));
+    let mut st = state.lock();
+    match id {
+        DeckId::A => st.deck_a = DeckUiState::default(),
+        DeckId::B => st.deck_b = DeckUiState::default(),
+    }
+    drop(st);
+    if let Some(ui) = ui_weak.upgrade() {
+        match id {
+            DeckId::A => {
+                ui.set_deck_a_title("".into());
+                ui.set_deck_a_artist("".into());
+                ui.set_deck_a_status("Empty".into());
+                ui.set_deck_a_can_play(false);
+                ui.set_deck_a_playing(false);
+                ui.set_deck_a_synced(false);
+                ui.set_deck_a_peaks(ModelRc::new(VecModel::from(Vec::<f32>::new())));
+                ui.set_deck_a_overview(ModelRc::new(VecModel::from(Vec::<f32>::new())));
+            }
+            DeckId::B => {
+                ui.set_deck_b_title("".into());
+                ui.set_deck_b_artist("".into());
+                ui.set_deck_b_status("Empty".into());
+                ui.set_deck_b_can_play(false);
+                ui.set_deck_b_playing(false);
+                ui.set_deck_b_synced(false);
+                ui.set_deck_b_peaks(ModelRc::new(VecModel::from(Vec::<f32>::new())));
+                ui.set_deck_b_overview(ModelRc::new(VecModel::from(Vec::<f32>::new())));
+            }
+        }
+    }
+}
+
+fn half_double_tempo(
+    engine: &AudioEngine,
+    state: &Arc<Mutex<AppState>>,
+    ui_weak: &Weak<AppWindow>,
+    id: DeckId,
+    factor: f64,
+) {
+    let mut st = state.lock();
+    let deck = match id {
+        DeckId::A => &mut st.deck_a,
+        DeckId::B => &mut st.deck_b,
+    };
+    if deck.bpm <= 0.0 {
+        return;
+    }
+    deck.bpm *= factor;
+    let bpm = deck.bpm;
+    let synced = deck.synced;
+    drop(st);
+    engine.send(EngineCommand::SetTrackBpm { id, bpm });
+    if synced {
+        engine.send(EngineCommand::SyncLock { follower: id });
+    }
+    if let Some(ui) = ui_weak.upgrade() {
+        match id {
+            DeckId::A => ui.set_deck_a_bpm(format!("{bpm:.2}").into()),
+            DeckId::B => ui.set_deck_b_bpm(format!("{bpm:.2}").into()),
+        }
+    }
+}
+
+fn shift_grid(
+    engine: &AudioEngine,
+    state: &Arc<Mutex<AppState>>,
+    ui_weak: &Weak<AppWindow>,
+    id: DeckId,
+    delta: f64,
+) {
+    let mut st = state.lock();
+    let deck = match id {
+        DeckId::A => &mut st.deck_a,
+        DeckId::B => &mut st.deck_b,
+    };
+    deck.grid_offset = (deck.grid_offset + delta).max(0.0);
+    let off = deck.grid_offset;
+    let dur = deck.duration.max(0.001);
+    let bpm = deck.bpm.max(1.0);
+    let beat_norm = (60.0 / bpm) / dur;
+    let grid_off_norm = (off / dur) as f32;
+    drop(st);
+    engine.send(EngineCommand::SetGridOffset {
+        id,
+        offset_secs: off,
+    });
+    if let Some(ui) = ui_weak.upgrade() {
+        match id {
+            DeckId::A => {
+                ui.set_deck_a_grid_offset(grid_off_norm);
+                ui.set_deck_a_beat_spacing(beat_norm as f32);
+            }
+            DeckId::B => {
+                ui.set_deck_b_grid_offset(grid_off_norm);
+                ui.set_deck_b_beat_spacing(beat_norm as f32);
+            }
+        }
     }
 }
 
@@ -871,7 +1842,6 @@ fn import_paths(ui_weak: &Weak<AppWindow>, db: &Arc<Mutex<LibraryDb>>, paths: &[
             match decode_file(path) {
                 Ok(decoded) => {
                     let mut row = track_row_from_meta(&decoded.meta, "Imported");
-                    // Quick BPM for library
                     let analysis = analyze_bpm(&decoded.samples, decoded.sample_rate);
                     row.bpm = analysis.bpm;
                     row.status = "Analyzed".into();
@@ -981,7 +1951,6 @@ fn load_path_on_deck(
             let a = analyze_bpm(&decoded.samples, decoded.sample_rate);
             let grid = BeatGrid::from_analysis(&a);
             let mut warp = WarpMap::from_constant(grid.effective_bpm(), decoded.meta.duration_secs);
-            // Seed an editable mid-track marker for elastic warp corrections.
             let mid_beat = grid.effective_bpm() * decoded.meta.duration_secs / 120.0;
             let mid_src = warp.beat_to_source(mid_beat);
             warp.add_marker(mid_src, mid_beat);
@@ -997,7 +1966,7 @@ fn load_path_on_deck(
             );
             (a.bpm, a.confidence, a.offset_secs, warp_json)
         };
-        let _ = (confidence, offset, warp_json);
+        let _ = (confidence, warp_json);
 
         set_status("Preparing warp");
         let peaks = waveform_peaks(&decoded.samples, 256);
@@ -1006,19 +1975,26 @@ fn load_path_on_deck(
 
         let mut row = track_row_from_meta(&decoded.meta, "Ready");
         row.bpm = bpm;
+        let track_id = row.id.clone();
+        let mut hot_flags = [false; 8];
+        let mut hot_secs = [0.0; 8];
         {
             let db = db.lock();
             let _ = db.upsert_track(&row);
-            // Ensure default playlist + hot cue slot 0 at track start exist for workflow.
             if let Ok(pid) = db.create_playlist("Default") {
                 let _ = db.add_to_playlist(&pid, &row.id, 0);
-            } else {
-                // Playlist may already exist — ignore unique errors.
             }
             let _ = db.set_hot_cue(&row.id, 0, 0.0, "Cue 1");
+            if let Ok(cues) = db.get_hot_cues(&row.id) {
+                for (slot, pos, _) in cues {
+                    if (0..8).contains(&slot) {
+                        hot_flags[slot as usize] = true;
+                        hot_secs[slot as usize] = pos;
+                    }
+                }
+            }
         }
 
-        // The engine renders at the device rate; convert so pitch and tempo are correct.
         let device_rate = engine.sample_rate() as u32;
         let samples = match resample_stereo(&decoded.samples, decoded.sample_rate, device_rate) {
             Ok(s) => s,
@@ -1034,9 +2010,21 @@ fn load_path_on_deck(
             sample_rate: device_rate,
             track_bpm: bpm,
             master_bpm,
+            grid_offset_secs: offset,
         });
 
         let meta = decoded.meta;
+        let duration = meta.duration_secs;
+        let beat_spacing = if bpm > 0.0 && duration > 0.0 {
+            ((60.0 / bpm) / duration) as f32
+        } else {
+            0.04
+        };
+        let grid_off_norm = if duration > 0.0 {
+            (offset / duration) as f32
+        } else {
+            0.0
+        };
         let ui_weak2 = ui_weak.clone();
         let state2 = Arc::clone(&state);
         let db2 = Arc::clone(&db);
@@ -1049,6 +2037,7 @@ fn load_path_on_deck(
             let bpm_text = format!("{bpm:.2}");
             let eff = format!("→ {master_bpm:.2} BPM");
             let dur = format_duration(meta.duration_secs);
+            let hot_model = ModelRc::new(VecModel::from(hot_flags.to_vec()));
 
             {
                 let mut st = state2.lock();
@@ -1069,6 +2058,13 @@ fn load_path_on_deck(
                 deck.playing = false;
                 deck.synced = false;
                 deck.path = Some(path.clone());
+                deck.track_id = Some(track_id);
+                deck.grid_offset = offset;
+                deck.hot_cues = hot_flags;
+                deck.hot_cue_secs = hot_secs;
+                deck.loop_on = false;
+                deck.loop_start_norm = -1.0;
+                deck.loop_end_norm = -1.0;
             }
 
             match id {
@@ -1091,6 +2087,12 @@ fn load_path_on_deck(
                     ui.set_deck_a_overview(overview_model);
                     ui.set_deck_a_effective_bpm(eff.into());
                     ui.set_deck_a_playhead(0.0);
+                    ui.set_deck_a_beat_spacing(beat_spacing);
+                    ui.set_deck_a_grid_offset(grid_off_norm);
+                    ui.set_deck_a_hot_cues(hot_model);
+                    ui.set_deck_a_loop_on(false);
+                    ui.set_deck_a_loop_start(-1.0);
+                    ui.set_deck_a_loop_end(-1.0);
                 }
                 DeckId::B => {
                     ui.set_deck_b_title(meta.title.clone().into());
@@ -1111,15 +2113,17 @@ fn load_path_on_deck(
                     ui.set_deck_b_overview(overview_model);
                     ui.set_deck_b_effective_bpm(eff.into());
                     ui.set_deck_b_playhead(0.0);
+                    ui.set_deck_b_beat_spacing(beat_spacing);
+                    ui.set_deck_b_grid_offset(grid_off_norm);
+                    ui.set_deck_b_hot_cues(hot_model);
+                    ui.set_deck_b_loop_on(false);
+                    ui.set_deck_b_loop_start(-1.0);
+                    ui.set_deck_b_loop_end(-1.0);
                 }
             }
             refresh_library(&ui, &db2, ui.get_library_search().as_str());
             ui.set_status_banner(
-                format!(
-                    "Ready: {} ({bpm:.2} BPM, confidence cached/analyzed)",
-                    meta.title
-                )
-                .into(),
+                format!("Ready: {} ({bpm:.2} BPM)", meta.title).into(),
             );
         });
     });
@@ -1148,7 +2152,6 @@ fn refresh_library(ui: &AppWindow, db: &Arc<Mutex<LibraryDb>>, query: &str) {
 }
 
 fn native_open_audio() -> Option<PathBuf> {
-    // Minimal Windows dialog via PowerShell to avoid extra deps.
     #[cfg(windows)]
     {
         let script = r#"
