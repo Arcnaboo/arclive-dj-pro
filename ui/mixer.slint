@@ -1,0 +1,138 @@
+import { Theme } from "theme.slint";
+import { Knob, Fader, Crossfader, MeterBar } from "controls.slint";
+
+export component MixerStrip inherits Rectangle {
+    in-out property <float> high-a: 0.5;
+    in-out property <float> mid-a: 0.5;
+    in-out property <float> low-a: 0.5;
+    in-out property <float> filter-a: 0.5;
+    in-out property <float> gain-a: 0.7;
+    in-out property <float> fader-a: 1.0;
+    in-out property <float> high-b: 0.5;
+    in-out property <float> mid-b: 0.5;
+    in-out property <float> low-b: 0.5;
+    in-out property <float> filter-b: 0.5;
+    in-out property <float> gain-b: 0.7;
+    in-out property <float> fader-b: 1.0;
+    in-out property <float> crossfader: 0.5;
+    in property <float> meter-a: 0.0;
+    in property <float> meter-b: 0.0;
+    in property <float> meter-master: 0.0;
+    in property <bool> clip-a: false;
+    in property <bool> clip-b: false;
+    in property <bool> clip-master: false;
+    in property <bool> cue-a: false;
+    in property <bool> cue-b: false;
+    in-out property <float> cue-blend: 0.0;
+    in-out property <float> headphone-vol: 0.8;
+
+    callback param-changed();
+    callback cue-a-toggled();
+    callback cue-b-toggled();
+
+    background: Theme.panel;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.border;
+    height: 180px;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        Text {
+            text: "MIXER";
+            color: Theme.text-secondary;
+            font-size: 11px;
+            font-weight: 700;
+            font-family: "Segoe UI";
+            horizontal-alignment: center;
+        }
+
+        HorizontalLayout {
+            spacing: 16px;
+            alignment: center;
+
+            // Deck A column
+            VerticalLayout {
+                spacing: 4px;
+                alignment: center;
+                Text { text: "DECK A"; color: Theme.deck-a; font-size: 10px; font-weight: 700; font-family: "Segoe UI"; horizontal-alignment: center; }
+                HorizontalLayout {
+                    spacing: 4px;
+                    Knob { label: "HIGH"; value: high-a; accent: Theme.deck-a; changed(v) => { high-a = v; root.param-changed(); } }
+                    Knob { label: "MID"; value: mid-a; accent: Theme.deck-a; changed(v) => { mid-a = v; root.param-changed(); } }
+                    Knob { label: "LOW"; value: low-a; accent: Theme.deck-a; changed(v) => { low-a = v; root.param-changed(); } }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+                    Knob { label: "FILTER"; value: filter-a; accent: Theme.deck-a; changed(v) => { filter-a = v; root.param-changed(); } }
+                    Knob { label: "GAIN"; value: gain-a; accent: Theme.deck-a; changed(v) => { gain-a = v; root.param-changed(); } }
+                    Fader { value: fader-a; accent: Theme.deck-a; changed(v) => { fader-a = v; root.param-changed(); } }
+                    MeterBar { level: meter-a; clipping: clip-a; }
+                }
+                Rectangle {
+                    height: 22px;
+                    border-radius: 3px;
+                    border-width: 1px;
+                    border-color: cue-a ? Theme.synced : Theme.border;
+                    background: cue-a ? Theme.synced.with-alpha(0.2) : Theme.elevated;
+                    Text { text: "CUE A"; color: cue-a ? Theme.synced : Theme.text-secondary; font-size: 10px; font-weight: 600; font-family: "Segoe UI"; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.cue-a-toggled(); } }
+                }
+            }
+
+            // Center
+            VerticalLayout {
+                spacing: 8px;
+                alignment: center;
+                horizontal-stretch: 1;
+                Text { text: "CROSSFADER"; color: Theme.text-secondary; font-size: 10px; font-family: "Segoe UI"; horizontal-alignment: center; }
+                Crossfader { value: crossfader; changed(v) => { crossfader = v; root.param-changed(); } }
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: center;
+                    MeterBar { level: meter-master; clipping: clip-master; height: 60px; }
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text { text: "MASTER"; color: Theme.text-primary; font-size: 10px; font-weight: 700; font-family: "Segoe UI"; horizontal-alignment: center; }
+                        Text { text: "HEADPHONE"; color: Theme.text-secondary; font-size: 9px; font-family: "Segoe UI"; horizontal-alignment: center; }
+                        Knob { label: "CUE/MST"; value: cue-blend; changed(v) => { cue-blend = v; root.param-changed(); } }
+                        Knob { label: "HP VOL"; value: headphone-vol; changed(v) => { headphone-vol = v; root.param-changed(); } }
+                    }
+                }
+            }
+
+            // Deck B column
+            VerticalLayout {
+                spacing: 4px;
+                alignment: center;
+                Text { text: "DECK B"; color: Theme.deck-b; font-size: 10px; font-weight: 700; font-family: "Segoe UI"; horizontal-alignment: center; }
+                HorizontalLayout {
+                    spacing: 4px;
+                    Knob { label: "LOW"; value: low-b; accent: Theme.deck-b; changed(v) => { low-b = v; root.param-changed(); } }
+                    Knob { label: "MID"; value: mid-b; accent: Theme.deck-b; changed(v) => { mid-b = v; root.param-changed(); } }
+                    Knob { label: "HIGH"; value: high-b; accent: Theme.deck-b; changed(v) => { high-b = v; root.param-changed(); } }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+                    MeterBar { level: meter-b; clipping: clip-b; }
+                    Fader { value: fader-b; accent: Theme.deck-b; changed(v) => { fader-b = v; root.param-changed(); } }
+                    Knob { label: "GAIN"; value: gain-b; accent: Theme.deck-b; changed(v) => { gain-b = v; root.param-changed(); } }
+                    Knob { label: "FILTER"; value: filter-b; accent: Theme.deck-b; changed(v) => { filter-b = v; root.param-changed(); } }
+                }
+                Rectangle {
+                    height: 22px;
+                    border-radius: 3px;
+                    border-width: 1px;
+                    border-color: cue-b ? Theme.synced : Theme.border;
+                    background: cue-b ? Theme.synced.with-alpha(0.2) : Theme.elevated;
+                    Text { text: "CUE B"; color: cue-b ? Theme.synced : Theme.text-secondary; font-size: 10px; font-weight: 600; font-family: "Segoe UI"; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.cue-b-toggled(); } }
+                }
+            }
+        }
+    }
+}

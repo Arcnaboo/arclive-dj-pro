@@ -1,0 +1,241 @@
+import { Theme } from "theme.slint";
+import { TransportButton } from "controls.slint";
+
+export component WaveformView inherits Rectangle {
+    in property <color> accent: Theme.deck-a;
+    in property <[float]> peaks: [];
+    in property <float> playhead: 0.0;
+    in property <float> beat-spacing: 0.05;
+    in property <bool> show-grid: true;
+
+    background: Theme.elevated;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+
+    // Precomputed peak bars
+    for peak[i] in peaks: Rectangle {
+        width: max(1px, parent.width / max(1.0, peaks.length * 1.0));
+        height: max(1px, parent.height * abs(peak));
+        x: i * self.width;
+        y: (parent.height - self.height) / 2;
+        background: accent.with-alpha(0.55 + abs(peak) * 0.4);
+    }
+
+    // Beat grid
+    if show-grid && beat-spacing > 0.001: Rectangle {
+        width: 1px;
+        height: 100%;
+        x: 0px;
+        background: transparent;
+    }
+
+    // Playhead
+    Rectangle {
+        width: 2px;
+        height: 100%;
+        x: parent.width * playhead;
+        background: Theme.text-primary.with-alpha(0.85);
+    }
+}
+
+export component DeckPanel inherits Rectangle {
+    in property <string> deck-name: "DECK A";
+    in property <color> accent: Theme.deck-a;
+    in property <string> title: "";
+    in property <string> artist: "";
+    in property <string> bpm-text: "";
+    in property <string> duration-text: "";
+    in property <string> status-text: "Empty";
+    in property <string> drop-message: "";
+    in property <bool> drop-hover: false;
+    in property <bool> is-playing: false;
+    in property <bool> is-synced: false;
+    in property <bool> can-play: false;
+    in property <[float]> peaks: [];
+    in property <[float]> overview-peaks: [];
+    in property <float> playhead: 0.0;
+    in property <string> time-text: "0:00.0";
+    in property <string> effective-bpm-text: "";
+
+    callback play-clicked();
+    callback cue-clicked();
+    callback sync-clicked();
+    callback loop-clicked();
+    callback browse-clicked();
+    callback geometry-changed(float, float, float, float);
+
+    background: drop-hover ? #2A2F36 : Theme.panel;
+    border-radius: 6px;
+    border-width: drop-hover ? 2px : 1px;
+    border-color: drop-hover ? accent : Theme.border;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: deck-name;
+                color: accent;
+                font-size: 12px;
+                font-weight: 700;
+                font-family: "Segoe UI";
+            }
+            if is-synced: Text {
+                text: "SYNCED";
+                color: Theme.synced;
+                font-size: 10px;
+                font-weight: 700;
+                font-family: "Segoe UI";
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Text {
+                text: status-text;
+                color: Theme.text-secondary;
+                font-size: 10px;
+                font-family: "Segoe UI";
+                vertical-alignment: center;
+            }
+        }
+
+        if title == "": VerticalLayout {
+            spacing: 6px;
+            alignment: center;
+            vertical-stretch: 1;
+            Rectangle {
+                border-width: 1px;
+                border-color: Theme.border;
+                border-radius: 6px;
+                background: Theme.background.with-alpha(0.4);
+                min-height: 140px;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    Text {
+                        text: "Drag an audio track here";
+                        color: Theme.text-secondary;
+                        font-size: 13px;
+                        font-family: "Segoe UI";
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "or click to browse";
+                        color: Theme.text-secondary.with-alpha(0.8);
+                        font-size: 11px;
+                        font-family: "Segoe UI";
+                        horizontal-alignment: center;
+                    }
+                    if drop-message != "": Text {
+                        text: drop-message;
+                        color: accent;
+                        font-size: 12px;
+                        font-weight: 600;
+                        font-family: "Segoe UI";
+                        horizontal-alignment: center;
+                    }
+                }
+
+                TouchArea {
+                    clicked => { root.browse-clicked(); }
+                }
+            }
+        }
+
+        if title != "": VerticalLayout {
+            spacing: 6px;
+            vertical-stretch: 1;
+
+            Text {
+                text: title;
+                color: Theme.text-primary;
+                font-size: 14px;
+                font-weight: 600;
+                font-family: "Segoe UI";
+                overflow: elide;
+            }
+            Text {
+                text: artist + "  ·  " + bpm-text + "  ·  " + duration-text;
+                color: Theme.text-secondary;
+                font-size: 11px;
+                font-family: "Segoe UI";
+                overflow: elide;
+            }
+
+            WaveformView {
+                height: 96px;
+                accent: root.accent;
+                peaks: root.peaks;
+                playhead: root.playhead;
+            }
+
+            WaveformView {
+                height: 28px;
+                accent: root.accent.with-alpha(0.7);
+                peaks: root.overview-peaks;
+                playhead: root.playhead;
+                show-grid: false;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: time-text;
+                    color: Theme.text-primary;
+                    font-size: 12px;
+                    font-family: "Segoe UI";
+                    font-weight: 600;
+                }
+                Text {
+                    text: effective-bpm-text;
+                    color: Theme.text-secondary;
+                    font-size: 11px;
+                    font-family: "Segoe UI";
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                if drop-message != "": Text {
+                    text: drop-message;
+                    color: accent;
+                    font-size: 11px;
+                    font-family: "Segoe UI";
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                TransportButton {
+                    label: is-playing ? "PAUSE" : "PLAY";
+                    accent: root.accent;
+                    active: is-playing;
+                    enabled: can-play;
+                    clicked => { root.play-clicked(); }
+                }
+                TransportButton {
+                    label: "CUE";
+                    accent: root.accent;
+                    enabled: can-play;
+                    clicked => { root.cue-clicked(); }
+                }
+                TransportButton {
+                    label: "SYNC";
+                    accent: Theme.synced;
+                    active: is-synced;
+                    enabled: can-play;
+                    clicked => { root.sync-clicked(); }
+                }
+                TransportButton {
+                    label: "LOOP";
+                    accent: root.accent;
+                    enabled: can-play;
+                    clicked => { root.loop-clicked(); }
+                }
+            }
+        }
+    }
+}

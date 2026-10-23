@@ -1,0 +1,379 @@
+import { Theme } from "theme.slint";
+import { DeckPanel } from "deck.slint";
+import { MixerStrip } from "mixer.slint";
+import { LibraryPanel, LibraryTrack } from "library.slint";
+import { SettingsPanel } from "settings.slint";
+
+export { LibraryTrack }
+
+export component AppWindow inherits Window {
+    title: "ArcLive DJ";
+    preferred-width: 1440px;
+    preferred-height: 900px;
+    min-width: 1100px;
+    min-height: 700px;
+    background: Theme.background;
+    default-font-family: "Segoe UI";
+
+    // Master
+    in-out property <float> master-bpm: 146.0;
+    in property <string> master-bpm-text: "146.00";
+    in property <string> status-banner: "";
+    in property <bool> settings-open: false;
+
+    // Deck A
+    in property <string> deck-a-title: "";
+    in property <string> deck-a-artist: "";
+    in property <string> deck-a-bpm: "";
+    in property <string> deck-a-duration: "";
+    in property <string> deck-a-status: "Empty";
+    in property <string> deck-a-drop-message: "";
+    in property <bool> deck-a-drop-hover: false;
+    in property <bool> deck-a-playing: false;
+    in property <bool> deck-a-synced: false;
+    in property <bool> deck-a-can-play: false;
+    in property <[float]> deck-a-peaks: [];
+    in property <[float]> deck-a-overview: [];
+    in property <float> deck-a-playhead: 0.0;
+    in property <string> deck-a-time: "0:00.0";
+    in property <string> deck-a-effective-bpm: "";
+
+    // Deck B
+    in property <string> deck-b-title: "";
+    in property <string> deck-b-artist: "";
+    in property <string> deck-b-bpm: "";
+    in property <string> deck-b-duration: "";
+    in property <string> deck-b-status: "Empty";
+    in property <string> deck-b-drop-message: "";
+    in property <bool> deck-b-drop-hover: false;
+    in property <bool> deck-b-playing: false;
+    in property <bool> deck-b-synced: false;
+    in property <bool> deck-b-can-play: false;
+    in property <[float]> deck-b-peaks: [];
+    in property <[float]> deck-b-overview: [];
+    in property <float> deck-b-playhead: 0.0;
+    in property <string> deck-b-time: "0:00.0";
+    in property <string> deck-b-effective-bpm: "";
+
+    // Mixer
+    in-out property <float> high-a: 0.5;
+    in-out property <float> mid-a: 0.5;
+    in-out property <float> low-a: 0.5;
+    in-out property <float> filter-a: 0.5;
+    in-out property <float> gain-a: 0.7;
+    in-out property <float> fader-a: 1.0;
+    in-out property <float> high-b: 0.5;
+    in-out property <float> mid-b: 0.5;
+    in-out property <float> low-b: 0.5;
+    in-out property <float> filter-b: 0.5;
+    in-out property <float> gain-b: 0.7;
+    in-out property <float> fader-b: 1.0;
+    in-out property <float> crossfader: 0.5;
+    in property <float> meter-a: 0.0;
+    in property <float> meter-b: 0.0;
+    in property <float> meter-master: 0.0;
+    in property <bool> clip-a: false;
+    in property <bool> clip-b: false;
+    in property <bool> clip-master: false;
+    in property <bool> cue-a: false;
+    in property <bool> cue-b: false;
+    in-out property <float> cue-blend: 0.0;
+    in-out property <float> headphone-vol: 0.8;
+
+    // Library
+    in property <[LibraryTrack]> library-tracks: [];
+    in-out property <string> library-search: "";
+    in property <bool> library-drop-hover: false;
+    in property <string> library-drop-message: "";
+    in property <int> library-selected: -1;
+    in property <bool> library-collapsed: false;
+
+    // Settings
+    in property <[string]> audio-devices: [];
+    in property <int> master-device-index: 0;
+    in property <int> cue-device-index: -1;
+    in property <string> sample-rate-text: "48000";
+    in property <string> buffer-text: "256";
+    in property <string> crossfader-curve: "Equal Power";
+    in property <bool> load-protection: true;
+    in property <bool> cue-available: false;
+    in property <string> settings-status: "";
+
+    // Layout geometry for hit-testing (logical px)
+    in-out property <float> deck-a-x: 0;
+    in-out property <float> deck-a-y: 0;
+    in-out property <float> deck-a-w: 0;
+    in-out property <float> deck-a-h: 0;
+    in-out property <float> deck-b-x: 0;
+    in-out property <float> deck-b-y: 0;
+    in-out property <float> deck-b-w: 0;
+    in-out property <float> deck-b-h: 0;
+    in-out property <float> library-x: 0;
+    in-out property <float> library-y: 0;
+    in-out property <float> library-w: 0;
+    in-out property <float> library-h: 0;
+
+    callback play-a();
+    callback cue-a-btn();
+    callback sync-a();
+    callback loop-a();
+    callback browse-a();
+    callback play-b();
+    callback cue-b-btn();
+    callback sync-b();
+    callback loop-b();
+    callback browse-b();
+    callback mixer-changed();
+    callback cue-a-toggle();
+    callback cue-b-toggle();
+    callback open-settings();
+    callback close-settings();
+    callback library-search-changed(string);
+    callback import-folder();
+    callback import-files();
+    callback library-row-activated(int);
+    callback toggle-library();
+    callback bpm-nudge(float);
+    callback bpm-tap();
+    callback toggle-load-protection();
+    callback cycle-crossfader-curve();
+    callback request-layout-sync();
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+
+        // Toolbar
+        HorizontalLayout {
+            spacing: 16px;
+            height: 40px;
+
+            Text {
+                text: "ARCLIVE";
+                color: Theme.text-primary;
+                font-size: 18px;
+                font-weight: 800;
+                font-family: "Segoe UI";
+                vertical-alignment: center;
+                letter-spacing: 1px;
+            }
+
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+
+            VerticalLayout {
+                spacing: 0px;
+                alignment: center;
+                Text {
+                    text: "MASTER BPM";
+                    color: Theme.text-secondary;
+                    font-size: 9px;
+                    font-weight: 700;
+                    font-family: "Segoe UI";
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: master-bpm-text;
+                    color: Theme.text-primary;
+                    font-size: 22px;
+                    font-weight: 700;
+                    font-family: "Segoe UI";
+                    horizontal-alignment: center;
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    scroll-event(e) => {
+                        root.bpm-nudge(e.delta-y > 0 ? 0.1 : -0.1);
+                        return accept;
+                    }
+                    clicked => { root.bpm-tap(); }
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+
+            Rectangle {
+                height: 28px;
+                min-width: 72px;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.elevated;
+                Text { text: "AUDIO"; color: Theme.text-primary; font-size: 11px; font-weight: 600; font-family: "Segoe UI"; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.open-settings(); } }
+            }
+            Rectangle {
+                height: 28px;
+                min-width: 84px;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.elevated;
+                Text { text: "SETTINGS"; color: Theme.text-primary; font-size: 11px; font-weight: 600; font-family: "Segoe UI"; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.open-settings(); } }
+            }
+        }
+
+        if status-banner != "": Text {
+            text: status-banner;
+            color: Theme.warning;
+            font-size: 11px;
+            font-family: "Segoe UI";
+        }
+
+        // Decks
+        HorizontalLayout {
+            spacing: 10px;
+            vertical-stretch: 2;
+
+            deck-a := DeckPanel {
+                deck-name: "DECK A";
+                accent: Theme.deck-a;
+                title: deck-a-title;
+                artist: deck-a-artist;
+                bpm-text: deck-a-bpm;
+                duration-text: deck-a-duration;
+                status-text: deck-a-status;
+                drop-message: deck-a-drop-message;
+                drop-hover: deck-a-drop-hover;
+                is-playing: deck-a-playing;
+                is-synced: deck-a-synced;
+                can-play: deck-a-can-play;
+                peaks: deck-a-peaks;
+                overview-peaks: deck-a-overview;
+                playhead: deck-a-playhead;
+                time-text: deck-a-time;
+                effective-bpm-text: deck-a-effective-bpm;
+                play-clicked => { root.play-a(); }
+                cue-clicked => { root.cue-a-btn(); }
+                sync-clicked => { root.sync-a(); }
+                loop-clicked => { root.loop-a(); }
+                browse-clicked => { root.browse-a(); }
+            }
+
+            deck-b := DeckPanel {
+                deck-name: "DECK B";
+                accent: Theme.deck-b;
+                title: deck-b-title;
+                artist: deck-b-artist;
+                bpm-text: deck-b-bpm;
+                duration-text: deck-b-duration;
+                status-text: deck-b-status;
+                drop-message: deck-b-drop-message;
+                drop-hover: deck-b-drop-hover;
+                is-playing: deck-b-playing;
+                is-synced: deck-b-synced;
+                can-play: deck-b-can-play;
+                peaks: deck-b-peaks;
+                overview-peaks: deck-b-overview;
+                playhead: deck-b-playhead;
+                time-text: deck-b-time;
+                effective-bpm-text: deck-b-effective-bpm;
+                play-clicked => { root.play-b(); }
+                cue-clicked => { root.cue-b-btn(); }
+                sync-clicked => { root.sync-b(); }
+                loop-clicked => { root.loop-b(); }
+                browse-clicked => { root.browse-b(); }
+            }
+        }
+
+        MixerStrip {
+            high-a <=> high-a;
+            mid-a <=> mid-a;
+            low-a <=> low-a;
+            filter-a <=> filter-a;
+            gain-a <=> gain-a;
+            fader-a <=> fader-a;
+            high-b <=> high-b;
+            mid-b <=> mid-b;
+            low-b <=> low-b;
+            filter-b <=> filter-b;
+            gain-b <=> gain-b;
+            fader-b <=> fader-b;
+            crossfader <=> crossfader;
+            meter-a: meter-a;
+            meter-b: meter-b;
+            meter-master: meter-master;
+            clip-a: clip-a;
+            clip-b: clip-b;
+            clip-master: clip-master;
+            cue-a: cue-a;
+            cue-b: cue-b;
+            cue-blend <=> cue-blend;
+            headphone-vol <=> headphone-vol;
+            param-changed => { root.mixer-changed(); }
+            cue-a-toggled => { root.cue-a-toggle(); }
+            cue-b-toggled => { root.cue-b-toggle(); }
+        }
+
+        lib := LibraryPanel {
+            tracks: library-tracks;
+            search <=> library-search;
+            drop-hover: library-drop-hover;
+            drop-message: library-drop-message;
+            selected-index: library-selected;
+            collapsed: library-collapsed;
+            search-changed(s) => { root.library-search-changed(s); }
+            import-folder => { root.import-folder(); }
+            import-files => { root.import-files(); }
+            row-activated(i) => { root.library-row-activated(i); }
+            toggle-collapsed => { root.toggle-library(); }
+        }
+    }
+
+    SettingsPanel {
+        open: settings-open;
+        devices: audio-devices;
+        master-device-index: master-device-index;
+        cue-device-index: cue-device-index;
+        sample-rate-text: sample-rate-text;
+        buffer-text: buffer-text;
+        crossfader-curve: crossfader-curve;
+        load-protection: load-protection;
+        cue-available: cue-available;
+        status-message: settings-status;
+        close => { root.close-settings(); }
+        toggle-load-protection => { root.toggle-load-protection(); }
+        cycle-crossfader-curve => { root.cycle-crossfader-curve(); }
+    }
+
+    // Periodically sync geometry via Rust timer; also on resize
+    changed width => { root.request-layout-sync(); }
+    changed height => { root.request-layout-sync(); }
+
+    // Performance-safe shortcuts (no accidental global Stop).
+    forward-focus: key-handler;
+    key-handler := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " ") {
+                root.play-a();
+                return accept;
+            }
+            if (event.text == "q" || event.text == "Q") {
+                root.cue-a-btn();
+                return accept;
+            }
+            if (event.text == "w" || event.text == "W") {
+                root.play-b();
+                return accept;
+            }
+            if (event.text == "e" || event.text == "E") {
+                root.cue-b-btn();
+                return accept;
+            }
+            if (event.text == "s" || event.text == "S") {
+                root.sync-b();
+                return accept;
+            }
+            if (event.text == "/") {
+                // Focus search by selecting library search field via banner hint
+                root.library-search-changed(library-search);
+                return accept;
+            }
+            if (event.text == ",") {
+                root.open-settings();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}

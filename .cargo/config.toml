@@ -1,0 +1,3 @@
+[build]
+# Keep artifacts inside the project tree for a predictable ArcLive.exe path.
+target-dir = "target"

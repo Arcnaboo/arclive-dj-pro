@@ -1,0 +1,203 @@
+import { Theme } from "theme.slint";
+
+export component Knob inherits Rectangle {
+    in-out property <float> value: 0.5;
+    in property <string> label: "";
+    in property <color> accent: Theme.text-secondary;
+    callback changed(float);
+
+    width: 44px;
+    height: 56px;
+    background: transparent;
+
+    property <float> drag-start-y: 0;
+    property <float> drag-start-value: 0.5;
+    property <bool> dragging: false;
+
+    VerticalLayout {
+        spacing: 2px;
+        alignment: center;
+
+        Rectangle {
+            width: 36px;
+            height: 36px;
+            border-radius: 18px;
+            border-width: 1.5px;
+            border-color: Theme.border;
+            background: Theme.elevated;
+
+            Text {
+                text: round(root.value * 100);
+                color: Theme.text-secondary;
+                font-size: 9px;
+                font-family: "Segoe UI";
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: label;
+            color: Theme.text-secondary;
+            font-size: 9px;
+            font-family: "Segoe UI";
+            horizontal-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        moved => {
+            if (self.pressed) {
+                if (!root.dragging) {
+                    root.dragging = true;
+                    root.drag-start-y = self.mouse-y / 1px;
+                    root.drag-start-value = root.value;
+                }
+                root.value = max(0.0, min(1.0, root.drag-start-value + (root.drag-start-y - self.mouse-y / 1px) / 80.0));
+                root.changed(root.value);
+            } else {
+                root.dragging = false;
+            }
+        }
+        double-clicked => {
+            root.value = 0.5;
+            root.changed(root.value);
+        }
+    }
+}
+
+export component Fader inherits Rectangle {
+    in-out property <float> value: 1.0;
+    in property <color> accent: Theme.text-secondary;
+    callback changed(float);
+
+    width: 28px;
+    height: 120px;
+    background: Theme.elevated;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    Rectangle {
+        width: 4px;
+        height: parent.height - 12px;
+        x: (parent.width - self.width) / 2;
+        y: 6px;
+        background: Theme.border;
+        border-radius: 2px;
+    }
+
+    Rectangle {
+        width: 18px;
+        height: 10px;
+        x: (parent.width - self.width) / 2;
+        y: 6px + (1.0 - root.value) * (parent.height - 22px);
+        background: accent;
+        border-radius: 2px;
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        moved => {
+            if (self.pressed) {
+                root.value = max(0.0, min(1.0, 1.0 - (self.mouse-y / 1px - 6.0) / (parent.height / 1px - 22.0)));
+                root.changed(root.value);
+            }
+        }
+    }
+}
+
+export component Crossfader inherits Rectangle {
+    in-out property <float> value: 0.5;
+    callback changed(float);
+
+    height: 28px;
+    background: Theme.elevated;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    Rectangle {
+        width: parent.width - 16px;
+        height: 3px;
+        x: 8px;
+        y: (parent.height - self.height) / 2;
+        background: Theme.border;
+        border-radius: 1.5px;
+    }
+
+    Rectangle {
+        width: 14px;
+        height: 18px;
+        x: 8px + root.value * (parent.width - 30px);
+        y: (parent.height - self.height) / 2;
+        background: Theme.text-primary;
+        border-radius: 3px;
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        moved => {
+            if (self.pressed) {
+                root.value = max(0.0, min(1.0, (self.mouse-x / 1px - 8.0) / (parent.width / 1px - 30.0)));
+                root.changed(root.value);
+            }
+        }
+        double-clicked => {
+            root.value = 0.5;
+            root.changed(root.value);
+        }
+    }
+}
+
+export component MeterBar inherits Rectangle {
+    in property <float> level: 0.0;
+    in property <bool> clipping: false;
+    width: 8px;
+    height: 80px;
+    background: Theme.elevated;
+    border-radius: 2px;
+
+    Rectangle {
+        width: parent.width;
+        height: max(0px, parent.height * level);
+        y: parent.height - self.height;
+        background: clipping ? Theme.error : Theme.synced;
+        border-radius: 2px;
+    }
+}
+
+export component TransportButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> active: false;
+    in property <color> accent: Theme.text-primary;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: 28px;
+    min-width: 52px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: active ? accent : Theme.border;
+    background: active ? #343941 : Theme.elevated;
+    opacity: enabled ? 1.0 : 0.45;
+
+    Text {
+        text: label;
+        color: active ? accent : Theme.text-primary;
+        font-size: 11px;
+        font-family: "Segoe UI";
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}

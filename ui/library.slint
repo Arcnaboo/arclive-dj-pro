@@ -1,0 +1,150 @@
+import { Theme } from "theme.slint";
+
+export struct LibraryTrack {
+    id: string,
+    title: string,
+    artist: string,
+    bpm: string,
+    duration: string,
+    key: string,
+    format: string,
+    status: string,
+}
+
+export component LibraryPanel inherits Rectangle {
+    in property <[LibraryTrack]> tracks: [];
+    in-out property <string> search: "";
+    in property <bool> drop-hover: false;
+    in property <string> drop-message: "";
+    in property <int> selected-index: -1;
+    in property <bool> collapsed: false;
+
+    callback search-changed(string);
+    callback import-folder();
+    callback import-files();
+    callback row-activated(int);
+    callback drag-row(int);
+    callback toggle-collapsed();
+
+    background: drop-hover ? #2A2F36 : Theme.panel;
+    border-radius: 6px;
+    border-width: drop-hover ? 2px : 1px;
+    border-color: drop-hover ? Theme.synced : Theme.border;
+    min-height: collapsed ? 36px : 160px;
+    vertical-stretch: collapsed ? 0 : 1;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 6px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "LIBRARY";
+                color: Theme.text-secondary;
+                font-size: 11px;
+                font-weight: 700;
+                font-family: "Segoe UI";
+                vertical-alignment: center;
+            }
+            Rectangle {
+                background: Theme.elevated;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: Theme.border;
+                horizontal-stretch: 1;
+                height: 26px;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    TextInput {
+                        text <=> search;
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        font-family: "Segoe UI";
+                        edited => { root.search-changed(self.text); }
+                    }
+                }
+            }
+            Rectangle {
+                height: 26px;
+                min-width: 96px;
+                border-radius: 4px;
+                background: Theme.elevated;
+                border-width: 1px;
+                border-color: Theme.border;
+                Text { text: "IMPORT FOLDER"; color: Theme.text-primary; font-size: 10px; font-weight: 600; font-family: "Segoe UI"; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.import-folder(); } }
+            }
+            Rectangle {
+                height: 26px;
+                min-width: 72px;
+                border-radius: 4px;
+                background: Theme.elevated;
+                border-width: 1px;
+                border-color: Theme.border;
+                Text { text: collapsed ? "EXPAND" : "COLLAPSE"; color: Theme.text-secondary; font-size: 10px; font-weight: 600; font-family: "Segoe UI"; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.toggle-collapsed(); } }
+            }
+        }
+
+        if drop-message != "": Text {
+            text: drop-message;
+            color: Theme.synced;
+            font-size: 11px;
+            font-family: "Segoe UI";
+        }
+
+        if !collapsed: HorizontalLayout {
+            spacing: 0px;
+            padding-left: 8px;
+            padding-right: 8px;
+            Text { text: "TITLE"; color: Theme.text-secondary; font-size: 10px; font-family: "Segoe UI"; horizontal-stretch: 3; }
+            Text { text: "ARTIST"; color: Theme.text-secondary; font-size: 10px; font-family: "Segoe UI"; horizontal-stretch: 2; }
+            Text { text: "BPM"; color: Theme.text-secondary; font-size: 10px; font-family: "Segoe UI"; width: 56px; }
+            Text { text: "DURATION"; color: Theme.text-secondary; font-size: 10px; font-family: "Segoe UI"; width: 72px; }
+            Text { text: "KEY"; color: Theme.text-secondary; font-size: 10px; font-family: "Segoe UI"; width: 48px; }
+            Text { text: "FORMAT"; color: Theme.text-secondary; font-size: 10px; font-family: "Segoe UI"; width: 56px; }
+            Text { text: "STATUS"; color: Theme.text-secondary; font-size: 10px; font-family: "Segoe UI"; width: 80px; }
+        }
+
+        if !collapsed: Rectangle {
+            vertical-stretch: 1;
+            background: Theme.background.with-alpha(0.5);
+            border-radius: 4px;
+            clip: true;
+
+            Flickable {
+                width: 100%;
+                height: 100%;
+                content-width: self.width;
+                content-height: tracks.length * 28px;
+
+                VerticalLayout {
+                    spacing: 0px;
+                    for track[i] in tracks: Rectangle {
+                        height: 28px;
+                        background: i == selected-index ? Theme.elevated : transparent;
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 0px;
+                            Text { text: track.title; color: Theme.text-primary; font-size: 11px; font-family: "Segoe UI"; overflow: elide; horizontal-stretch: 3; vertical-alignment: center; }
+                            Text { text: track.artist; color: Theme.text-secondary; font-size: 11px; font-family: "Segoe UI"; overflow: elide; horizontal-stretch: 2; vertical-alignment: center; }
+                            Text { text: track.bpm; color: Theme.text-primary; font-size: 11px; font-family: "Segoe UI"; width: 56px; vertical-alignment: center; }
+                            Text { text: track.duration; color: Theme.text-secondary; font-size: 11px; font-family: "Segoe UI"; width: 72px; vertical-alignment: center; }
+                            Text { text: track.key; color: Theme.text-secondary; font-size: 11px; font-family: "Segoe UI"; width: 48px; vertical-alignment: center; }
+                            Text { text: track.format; color: Theme.text-secondary; font-size: 11px; font-family: "Segoe UI"; width: 56px; vertical-alignment: center; }
+                            Text { text: track.status; color: Theme.text-secondary; font-size: 11px; font-family: "Segoe UI"; width: 80px; vertical-alignment: center; }
+                        }
+
+                        TouchArea {
+                            clicked => { root.row-activated(i); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
